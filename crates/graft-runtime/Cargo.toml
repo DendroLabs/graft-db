@@ -8,6 +8,8 @@ description = "Shard-per-core runtime: core pinning, message passing, event loop
 [dependencies]
 graft-core = { workspace = true }
 graft-query = { workspace = true }
+graft-storage = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

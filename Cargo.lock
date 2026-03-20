@@ -549,6 +549,8 @@ dependencies = [
  "criterion",
  "graft-core",
  "graft-query",
+ "graft-storage",
+ "hashbrown 0.15.5",
 ]
 
 [[package]]

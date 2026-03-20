@@ -1,43 +1,45 @@
-use graft_core::{EdgeId, LabelId, NodeId, ShardId};
+use std::cell::RefCell;
+
+use graft_core::{EdgeId, LabelId, NodeId, PageId, ShardId};
 use graft_query::executor::{EdgeInfo, NodeInfo, StorageAccess, Value};
+use graft_storage::page::PageType;
+use graft_storage::{BufferPool, EdgeRecord, NodeRecord, Page};
+use hashbrown::HashMap;
 
 use crate::label::LabelDictionary;
 
-// ---------------------------------------------------------------------------
-// Internal node/edge records
-// ---------------------------------------------------------------------------
-
-struct NodeRecord {
-    id: NodeId,
-    label: LabelId,
-    first_out_edge: EdgeId,
-    first_in_edge: EdgeId,
-    properties: Vec<(String, Value)>,
-    deleted: bool,
-}
-
-struct EdgeRecord {
-    id: EdgeId,
-    source: NodeId,
-    target: NodeId,
-    label: LabelId,
-    next_out_edge: EdgeId, // next outbound edge from same source
-    next_in_edge: EdgeId,  // next inbound edge to same target
-    properties: Vec<(String, Value)>,
-    deleted: bool,
-}
+// Default buffer pool capacity (pages) per pool.
+const DEFAULT_POOL_CAPACITY: usize = 1024;
 
 // ---------------------------------------------------------------------------
-// Shard — a single data partition
+// Shard — a single data partition backed by page-based storage
 // ---------------------------------------------------------------------------
 
 pub struct Shard {
     shard_id: ShardId,
     pub(crate) labels: LabelDictionary,
-    nodes: Vec<NodeRecord>,
-    edges: Vec<EdgeRecord>,
+
+    // Page-based storage — wrapped in RefCell because BufferPool::pin/unpin
+    // require &mut self, but StorageAccess reads take &self. Shards are
+    // single-threaded so RefCell is safe.
+    node_pool: RefCell<BufferPool>,
+    edge_pool: RefCell<BufferPool>,
+
+    // ID → (page_id, slot) indexes for O(1) lookup
+    node_index: HashMap<u64, (PageId, u16)>,
+    edge_index: HashMap<u64, (PageId, u16)>,
+
+    // Property side-tables (keyed by raw id + property name)
+    node_props: HashMap<(u64, String), Value>,
+    edge_props: HashMap<(u64, String), Value>,
+
+    // Monotonic counters
     next_node_local: u64,
     next_edge_local: u64,
+
+    // Page ID counters (separate namespaces for node/edge pools)
+    next_node_page_id: PageId,
+    next_edge_page_id: PageId,
 }
 
 impl Shard {
@@ -45,10 +47,16 @@ impl Shard {
         Self {
             shard_id,
             labels: LabelDictionary::new(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
+            node_pool: RefCell::new(BufferPool::new(DEFAULT_POOL_CAPACITY)),
+            edge_pool: RefCell::new(BufferPool::new(DEFAULT_POOL_CAPACITY)),
+            node_index: HashMap::new(),
+            edge_index: HashMap::new(),
+            node_props: HashMap::new(),
+            edge_props: HashMap::new(),
             next_node_local: 1, // 0 is NULL sentinel
             next_edge_local: 1,
+            next_node_page_id: 1,
+            next_edge_page_id: 1,
         }
     }
 
@@ -68,20 +76,120 @@ impl Shard {
         id
     }
 
-    fn find_node(&self, id: NodeId) -> Option<&NodeRecord> {
-        self.nodes.iter().find(|n| n.id == id && !n.deleted)
+    // -- Page allocation helpers -----------------------------------------------
+
+    /// Find a node page with a free slot, or allocate a new one.
+    fn alloc_node_slot(&mut self) -> (PageId, u16) {
+        let mut pool = self.node_pool.borrow_mut();
+
+        // Try the most recent page first
+        if self.next_node_page_id > 1 {
+            let last_page_id = self.next_node_page_id - 1;
+            if let Some(fid) = pool.pin(last_page_id) {
+                let page = pool.page_mut(fid);
+                if !page.is_full() {
+                    let slot = page.alloc_slot().unwrap();
+                    pool.unpin(fid);
+                    return (last_page_id, slot);
+                }
+                pool.unpin(fid);
+            }
+        }
+
+        // Allocate a new page
+        let page_id = self.next_node_page_id;
+        self.next_node_page_id += 1;
+        let page = Page::new(page_id, PageType::Node);
+        pool.create(page).expect("node pool create failed");
+        let fid = pool.pin(page_id).unwrap();
+        let slot = pool.page_mut(fid).alloc_slot().unwrap();
+        pool.unpin(fid);
+        (page_id, slot)
     }
 
-    fn find_node_mut(&mut self, id: NodeId) -> Option<&mut NodeRecord> {
-        self.nodes.iter_mut().find(|n| n.id == id && !n.deleted)
+    /// Find an edge page with a free slot, or allocate a new one.
+    fn alloc_edge_slot(&mut self) -> (PageId, u16) {
+        let mut pool = self.edge_pool.borrow_mut();
+
+        if self.next_edge_page_id > 1 {
+            let last_page_id = self.next_edge_page_id - 1;
+            if let Some(fid) = pool.pin(last_page_id) {
+                let page = pool.page_mut(fid);
+                if !page.is_full() {
+                    let slot = page.alloc_slot().unwrap();
+                    pool.unpin(fid);
+                    return (last_page_id, slot);
+                }
+                pool.unpin(fid);
+            }
+        }
+
+        let page_id = self.next_edge_page_id;
+        self.next_edge_page_id += 1;
+        let page = Page::new(page_id, PageType::Edge);
+        pool.create(page).expect("edge pool create failed");
+        let fid = pool.pin(page_id).unwrap();
+        let slot = pool.page_mut(fid).alloc_slot().unwrap();
+        pool.unpin(fid);
+        (page_id, slot)
     }
 
-    fn find_edge(&self, id: EdgeId) -> Option<&EdgeRecord> {
-        self.edges.iter().find(|e| e.id == id && !e.deleted)
+    // -- Record read/write helpers ---------------------------------------------
+
+    fn read_node_record(&self, page_id: PageId, slot: u16) -> Option<NodeRecord> {
+        let mut pool = self.node_pool.borrow_mut();
+        let fid = pool.pin(page_id)?;
+        let buf = pool.page(fid).read_record(slot).ok()?;
+        let rec = NodeRecord::read_from(buf);
+        pool.unpin(fid);
+        Some(rec)
     }
 
-    fn find_edge_mut(&mut self, id: EdgeId) -> Option<&mut EdgeRecord> {
-        self.edges.iter_mut().find(|e| e.id == id && !e.deleted)
+    fn write_node_record(&self, page_id: PageId, slot: u16, rec: &NodeRecord) {
+        let mut pool = self.node_pool.borrow_mut();
+        let fid = pool.pin(page_id).expect("page not in pool");
+        pool.page_mut(fid)
+            .write_record(slot, &rec.to_bytes())
+            .expect("write_record failed");
+        pool.unpin(fid);
+    }
+
+    fn read_edge_record(&self, page_id: PageId, slot: u16) -> Option<EdgeRecord> {
+        let mut pool = self.edge_pool.borrow_mut();
+        let fid = pool.pin(page_id)?;
+        let buf = pool.page(fid).read_record(slot).ok()?;
+        let rec = EdgeRecord::read_from(buf);
+        pool.unpin(fid);
+        Some(rec)
+    }
+
+    fn write_edge_record(&self, page_id: PageId, slot: u16, rec: &EdgeRecord) {
+        let mut pool = self.edge_pool.borrow_mut();
+        let fid = pool.pin(page_id).expect("page not in pool");
+        pool.page_mut(fid)
+            .write_record(slot, &rec.to_bytes())
+            .expect("write_record failed");
+        pool.unpin(fid);
+    }
+
+    // -- Lookup helpers --------------------------------------------------------
+
+    fn find_node(&self, id: NodeId) -> Option<NodeRecord> {
+        let &(page_id, slot) = self.node_index.get(&id.as_u64())?;
+        let rec = self.read_node_record(page_id, slot)?;
+        if rec.is_deleted() || rec.node_id.is_null() {
+            return None;
+        }
+        Some(rec)
+    }
+
+    fn find_edge(&self, id: EdgeId) -> Option<EdgeRecord> {
+        let &(page_id, slot) = self.edge_index.get(&id.as_u64())?;
+        let rec = self.read_edge_record(page_id, slot)?;
+        if rec.is_deleted() || rec.edge_id.is_null() {
+            return None;
+        }
+        Some(rec)
     }
 }
 
@@ -93,40 +201,45 @@ impl StorageAccess for Shard {
     fn scan_nodes(&self, label: Option<&str>) -> Vec<NodeInfo> {
         let label_id = label.and_then(|l| self.labels.get(l));
 
-        // If a label was requested but doesn't exist in the dictionary,
-        // there can be no matching nodes.
         if label.is_some() && label_id.is_none() {
             return Vec::new();
         }
 
-        self.nodes
-            .iter()
-            .filter(|n| !n.deleted)
-            .filter(|n| match label_id {
-                Some(lid) => n.label == lid,
-                None => true,
-            })
-            .map(|n| NodeInfo {
-                id: n.id,
-                label: self.labels.name(n.label).map(String::from),
-            })
-            .collect()
+        let mut result = Vec::new();
+        for (&raw_id, &(page_id, slot)) in &self.node_index {
+            if let Some(rec) = self.read_node_record(page_id, slot) {
+                if rec.is_deleted() || rec.node_id.is_null() {
+                    continue;
+                }
+                if let Some(lid) = label_id {
+                    if rec.label_id != lid {
+                        continue;
+                    }
+                }
+                result.push(NodeInfo {
+                    id: NodeId::from_raw(raw_id),
+                    label: self.labels.name(rec.label_id).map(String::from),
+                });
+            }
+        }
+        result
     }
 
     fn get_node(&self, id: NodeId) -> Option<NodeInfo> {
-        self.find_node(id).map(|n| NodeInfo {
-            id: n.id,
-            label: self.labels.name(n.label).map(String::from),
+        let rec = self.find_node(id)?;
+        Some(NodeInfo {
+            id: rec.node_id,
+            label: self.labels.name(rec.label_id).map(String::from),
         })
     }
 
     fn node_property(&self, id: NodeId, key: &str) -> Value {
-        self.find_node(id)
-            .and_then(|n| {
-                n.properties
-                    .iter()
-                    .find_map(|(k, v)| if k == key { Some(v.clone()) } else { None })
-            })
+        if self.find_node(id).is_none() {
+            return Value::Null;
+        }
+        self.node_props
+            .get(&(id.as_u64(), key.to_owned()))
+            .cloned()
             .unwrap_or(Value::Null)
     }
 
@@ -136,24 +249,24 @@ impl StorageAccess for Shard {
             return Vec::new();
         }
 
-        let mut result = Vec::new();
         let node = match self.find_node(node_id) {
             Some(n) => n,
-            None => return result,
+            None => return Vec::new(),
         };
 
+        let mut result = Vec::new();
         let mut edge_id = node.first_out_edge;
         while !edge_id.is_null() {
             let edge = match self.find_edge(edge_id) {
                 Some(e) => e,
                 None => break,
             };
-            if label_id.is_none() || edge.label == label_id.unwrap() {
+            if label_id.is_none() || edge.label_id == label_id.unwrap() {
                 result.push(EdgeInfo {
-                    id: edge.id,
+                    id: edge.edge_id,
                     source: edge.source,
                     target: edge.target,
-                    label: self.labels.name(edge.label).map(String::from),
+                    label: self.labels.name(edge.label_id).map(String::from),
                 });
             }
             edge_id = edge.next_out_edge;
@@ -167,24 +280,24 @@ impl StorageAccess for Shard {
             return Vec::new();
         }
 
-        let mut result = Vec::new();
         let node = match self.find_node(node_id) {
             Some(n) => n,
-            None => return result,
+            None => return Vec::new(),
         };
 
+        let mut result = Vec::new();
         let mut edge_id = node.first_in_edge;
         while !edge_id.is_null() {
             let edge = match self.find_edge(edge_id) {
                 Some(e) => e,
                 None => break,
             };
-            if label_id.is_none() || edge.label == label_id.unwrap() {
+            if label_id.is_none() || edge.label_id == label_id.unwrap() {
                 result.push(EdgeInfo {
-                    id: edge.id,
+                    id: edge.edge_id,
                     source: edge.source,
                     target: edge.target,
-                    label: self.labels.name(edge.label).map(String::from),
+                    label: self.labels.name(edge.label_id).map(String::from),
                 });
             }
             edge_id = edge.next_in_edge;
@@ -193,12 +306,12 @@ impl StorageAccess for Shard {
     }
 
     fn edge_property(&self, id: EdgeId, key: &str) -> Value {
-        self.find_edge(id)
-            .and_then(|e| {
-                e.properties
-                    .iter()
-                    .find_map(|(k, v)| if k == key { Some(v.clone()) } else { None })
-            })
+        if self.find_edge(id).is_none() {
+            return Value::Null;
+        }
+        self.edge_props
+            .get(&(id.as_u64(), key.to_owned()))
+            .cloned()
             .unwrap_or(Value::Null)
     }
 
@@ -212,14 +325,15 @@ impl StorageAccess for Shard {
             .map(|l| self.labels.get_or_insert(l))
             .unwrap_or(LabelId::NONE);
 
-        self.nodes.push(NodeRecord {
-            id,
-            label: label_id,
-            first_out_edge: EdgeId::NULL,
-            first_in_edge: EdgeId::NULL,
-            properties: properties.to_vec(),
-            deleted: false,
-        });
+        let rec = NodeRecord::new(id, label_id, 0);
+        let (page_id, slot) = self.alloc_node_slot();
+        self.write_node_record(page_id, slot, &rec);
+        self.node_index.insert(id.as_u64(), (page_id, slot));
+
+        for (k, v) in properties {
+            self.node_props.insert((id.as_u64(), k.clone()), v.clone());
+        }
+
         id
     }
 
@@ -235,7 +349,7 @@ impl StorageAccess for Shard {
             .map(|l| self.labels.get_or_insert(l))
             .unwrap_or(LabelId::NONE);
 
-        // Read current head pointers before creating the edge
+        // Read current head pointers
         let old_out_head = self
             .find_node(source)
             .map(|n| n.first_out_edge)
@@ -245,58 +359,71 @@ impl StorageAccess for Shard {
             .map(|n| n.first_in_edge)
             .unwrap_or(EdgeId::NULL);
 
-        // Insert edge at the head of both linked lists
-        self.edges.push(EdgeRecord {
-            id,
-            source,
-            target,
-            label: label_id,
-            next_out_edge: old_out_head,
-            next_in_edge: old_in_head,
-            properties: properties.to_vec(),
-            deleted: false,
-        });
+        // Create edge record with linked list pointers
+        let mut rec = EdgeRecord::new(id, source, target, label_id, 0);
+        rec.next_out_edge = old_out_head;
+        rec.next_in_edge = old_in_head;
 
-        // Update head pointers on source and target nodes
-        if let Some(node) = self.find_node_mut(source) {
-            node.first_out_edge = id;
+        let (page_id, slot) = self.alloc_edge_slot();
+        self.write_edge_record(page_id, slot, &rec);
+        self.edge_index.insert(id.as_u64(), (page_id, slot));
+
+        // Update source node's first_out_edge
+        if let Some(&(np, ns)) = self.node_index.get(&source.as_u64()) {
+            if let Some(mut node_rec) = self.read_node_record(np, ns) {
+                if !node_rec.is_deleted() {
+                    node_rec.first_out_edge = id;
+                    self.write_node_record(np, ns, &node_rec);
+                }
+            }
         }
-        if let Some(node) = self.find_node_mut(target) {
-            node.first_in_edge = id;
+
+        // Update target node's first_in_edge
+        if let Some(&(np, ns)) = self.node_index.get(&target.as_u64()) {
+            if let Some(mut node_rec) = self.read_node_record(np, ns) {
+                if !node_rec.is_deleted() {
+                    node_rec.first_in_edge = id;
+                    self.write_node_record(np, ns, &node_rec);
+                }
+            }
+        }
+
+        for (k, v) in properties {
+            self.edge_props.insert((id.as_u64(), k.clone()), v.clone());
         }
 
         id
     }
 
     fn set_node_property(&mut self, id: NodeId, key: &str, value: &Value) {
-        if let Some(node) = self.find_node_mut(id) {
-            if let Some(prop) = node.properties.iter_mut().find(|(k, _)| k == key) {
-                prop.1 = value.clone();
-            } else {
-                node.properties.push((key.to_owned(), value.clone()));
-            }
+        if self.find_node(id).is_some() {
+            self.node_props
+                .insert((id.as_u64(), key.to_owned()), value.clone());
         }
     }
 
     fn set_edge_property(&mut self, id: EdgeId, key: &str, value: &Value) {
-        if let Some(edge) = self.find_edge_mut(id) {
-            if let Some(prop) = edge.properties.iter_mut().find(|(k, _)| k == key) {
-                prop.1 = value.clone();
-            } else {
-                edge.properties.push((key.to_owned(), value.clone()));
-            }
+        if self.find_edge(id).is_some() {
+            self.edge_props
+                .insert((id.as_u64(), key.to_owned()), value.clone());
         }
     }
 
     fn delete_node(&mut self, id: NodeId) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
-            node.deleted = true;
+        if let Some(&(page_id, slot)) = self.node_index.get(&id.as_u64()) {
+            if let Some(mut rec) = self.read_node_record(page_id, slot) {
+                rec.tx_max = 1; // non-zero = deleted
+                self.write_node_record(page_id, slot, &rec);
+            }
         }
     }
 
     fn delete_edge(&mut self, id: EdgeId) {
-        if let Some(edge) = self.edges.iter_mut().find(|e| e.id == id) {
-            edge.deleted = true;
+        if let Some(&(page_id, slot)) = self.edge_index.get(&id.as_u64()) {
+            if let Some(mut rec) = self.read_edge_record(page_id, slot) {
+                rec.tx_max = 1; // non-zero = deleted
+                self.write_edge_record(page_id, slot, &rec);
+            }
         }
     }
 }
@@ -304,6 +431,7 @@ impl StorageAccess for Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graft_core::constants::RECORDS_PER_PAGE;
 
     #[test]
     fn create_and_scan_nodes() {
@@ -339,17 +467,14 @@ mod tests {
         let bob = shard.create_node(Some("Person"), &[]);
         let edge = shard.create_edge(alice, bob, Some("KNOWS"), &[("since".into(), Value::Int(2020))]);
 
-        // Outbound from Alice
         let out = shard.outbound_edges(alice, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].target, bob);
 
-        // Inbound to Bob
         let inb = shard.inbound_edges(bob, None);
         assert_eq!(inb.len(), 1);
         assert_eq!(inb[0].source, alice);
 
-        // Edge property
         assert_eq!(shard.edge_property(edge, "since"), Value::Int(2020));
     }
 
@@ -360,13 +485,11 @@ mod tests {
         let b = shard.create_node(Some("N"), &[]);
         let c = shard.create_node(Some("N"), &[]);
 
-        // a->b, a->c — two outbound edges from a
         shard.create_edge(a, b, Some("E"), &[]);
         shard.create_edge(a, c, Some("E"), &[]);
 
         let out = shard.outbound_edges(a, None);
         assert_eq!(out.len(), 2);
-        // Head insertion means most recent edge comes first
         assert_eq!(out[0].target, c);
         assert_eq!(out[1].target, b);
     }
@@ -410,9 +533,17 @@ mod tests {
         let eid = shard.create_edge(a, b, None, &[]);
         assert_eq!(shard.outbound_edges(a, None).len(), 1);
         shard.delete_edge(eid);
-        // Edge is deleted, but since we use soft deletion the linked-list
-        // walk skips it (find_edge returns None for deleted edges, breaking
-        // the walk). For now this means traversal stops at a deleted edge.
-        // Full unlink is a future optimization.
+        // Edge is deleted — linked-list walk breaks at deleted edge.
+    }
+
+    #[test]
+    fn page_fills_and_spills() {
+        let mut shard = Shard::new(0);
+        let count = RECORDS_PER_PAGE + 10;
+        for i in 0..count {
+            shard.create_node(Some("N"), &[("i".into(), Value::Int(i as i64))]);
+        }
+        assert_eq!(shard.scan_nodes(Some("N")).len(), count);
+        assert!(shard.next_node_page_id > 2, "should have allocated 2+ pages");
     }
 }
