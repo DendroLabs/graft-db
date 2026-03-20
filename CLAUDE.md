@@ -52,10 +52,18 @@ crates/
 - Single shared atomic: global commit counter (AtomicU64)
 
 ### Transaction Model
-- MVCC with append-only version chains per shard
-- Per-shard WAL files with 64KB write buffer and group commit (2ms window)
+- MVCC with per-shard `TransactionManager` tracking active/committed transactions
+- Auto-commit: every query is implicitly wrapped in a transaction (begin before, commit/abort after)
+- `Snapshot` visibility: checks `tx_min`/`tx_max` against snapshot timestamp and active set
+- Own-writes visible within a transaction (special case in `is_record_visible`)
+- `was_committed()` handles both current-session and post-recovery (pre-`base_tx_id`) visibility
+- Per-shard WAL files with 64KB write buffer; WAL records stamped with `current_tx`
+- Two-pass WAL recovery: pass 1 builds committed tx set, pass 2 replays only committed writes
 - Snapshot isolation with first-committer-wins conflict detection
-- Checkpoints every 5 min or 100MB WAL
+- Edge chain traversal reads raw records for next pointers, checks visibility separately (invisible edges skipped without breaking chain)
+- `StorageAccess` trait has `begin_tx/commit_tx/abort_tx` (default no-ops for backward compat)
+- `ShardCluster` generates global tx_id via `AtomicU64`, routes `BeginTx/CommitTx/AbortTx` to all shard workers
+- Deferred: explicit `BEGIN`/`COMMIT`/`ROLLBACK` over wire protocol (requires per-connection tx state)
 
 ### Query Engine
 - LALRPOP parser (LR(1), build-time codegen) with hand-written lexer
@@ -70,8 +78,10 @@ crates/
   - **Variable-length paths**: `*`, `*N`, `*N..M`, `*N..`, `*..M` (BFS with cycle detection)
 
 ### I/O Layer
-- `IoBackend` trait with swappable implementations
-- `IoUringBackend` (Linux production), `PosixIoBackend` (macOS dev), `SimIoBackend` (testing)
+- `IoBackend: Send` trait with swappable implementations, `default_backend()` auto-selects best platform backend
+- `IoUringBackend` (Linux production): O_DIRECT for data files (bypasses kernel page cache), fdatasync for direct files, pread/pwrite fallback for WAL (small sequential writes), EINVAL fallback for filesystems without O_DIRECT (e.g. tmpfs)
+- `PosixIoBackend` (macOS dev), `SimIoBackend` (testing)
+- `Shard::open_with_io()` accepts `Box<dyn IoBackend + Send>` for caller-provided backends
 - All non-determinism behind injectable interfaces (I/O, time, RNG) for simulation testing
 
 ### Wire Protocol
@@ -105,15 +115,16 @@ cargo run --bin graft-cli -- connect localhost:7687
 
 1. ~~Skeleton + core types (graft-core)~~ — **done**: NodeId/EdgeId/LabelId with shard encoding, constants, errors, property types, wire protocol
 2. ~~Storage engine (graft-storage)~~ — **done**: 8KB pages, node/edge records, buffer pool with CLOCK eviction
-3. ~~I/O layer (graft-io)~~ — **done**: IoBackend trait, SimIoBackend, PosixIoBackend, io_uring stub
+3. ~~I/O layer (graft-io)~~ — **done**: IoBackend trait (Send supertrait), SimIoBackend, PosixIoBackend, IoUringBackend (O_DIRECT, fdatasync), default_backend() auto-selection
 4. ~~Custom allocators (graft-alloc)~~ — **done**: SlabAllocator<T>, Arena with chunk growth
 5. ~~WAL + transactions (graft-txn)~~ — **done**: MVCC visibility, WAL with CRC, snapshot isolation, first-committer-wins
 6. ~~Query engine (graft-query)~~ — **done**: LALRPOP parser, hand-written lexer, planner, executor with scalar functions, IS NULL, string predicates, variable-length paths, aggregations, DISTINCT
 7. ~~Shard-per-core runtime (graft-runtime)~~ — **done**: multi-shard Database, ShardCluster (thread-per-shard with SPSC message passing), cooperative event loop skeleton, shard mesh builder. Queries execute across real OS threads with fan-out for scans and targeted routing for point lookups.
 8. ~~Server + CLI~~ — **done**: graft-server uses ShardCluster (thread-per-shard, `--shards` flag, defaults to CPU count), graft-client is a sync TCP client, graft-cli is a rustyline REPL with comfy-table output. Wire protocol integration tests cover multi-shard queries.
-9. **Next**: connect graft-storage (page-based) and graft-txn (MVCC/WAL) to runtime shards for persistence
-10. **Next**: connect graft-storage (page-based) and graft-txn (MVCC/WAL) to runtime shards for persistence
-11. **Next**: io_uring backend + benchmarks, core pinning
+9. ~~Persistence~~ — **done**: Shard::open() with page-based storage, WAL-logged mutations, dirty page flush, recovery via file scan + WAL replay, buffer pool eviction writes to disk
+10. ~~MVCC transactions~~ — **done**: per-shard TransactionManager, auto-commit in executor, Snapshot visibility, own-writes, two-pass WAL recovery (committed-only replay), tx_min/tx_max stamping, edge chain MVCC traversal, 221 tests passing
+11. ~~io_uring backend~~ — **done**: IoUringBackend with O_DIRECT for data files, fdatasync, EINVAL fallback, Shard generic over IoBackend via Box<dyn IoBackend + Send>, default_backend() auto-selects io_uring on Linux
+12. **Next**: benchmarks (criterion), core pinning
 
 ## Key Dependencies
 
@@ -126,6 +137,8 @@ lalrpop, rmp-serde, ahash, hashbrown, crossbeam, io-uring, rustyline, comfy-tabl
 - **Simulation-testable** — all non-determinism behind injectable interfaces from day one
 - **Standards-first** — GQL, not a proprietary query language
 - **Truly open source** — AGPL v3, every feature in one codebase
+- **Reliability over convenience** — when choosing between implementation approaches, always choose the option that is more reliable under worst-case scenarios (crashes, corruption, partial writes), even if it requires more upfront work. No shortcuts that create separate failure modes or custom formats when a uniform mechanism exists.
+- **Scale beyond competitors** — every design decision must consider what happens at 1B+ nodes and edges. If an approach requires all data of a certain type to fit in memory, or creates an O(n) bottleneck that competitors don't have, it's the wrong approach. Design for larger-than-competitor scale from the start.
 
 ## Research
 

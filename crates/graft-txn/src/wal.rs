@@ -71,11 +71,13 @@ pub enum WalBody {
     PageWrite {
         page_id: PageId,
         slot: u16,
+        page_type: u8,
         data: [u8; RECORD_SIZE],
     },
     PageClear {
         page_id: PageId,
         slot: u16,
+        page_type: u8,
     },
 }
 
@@ -94,17 +96,24 @@ impl WalBody {
             Self::PageWrite {
                 page_id,
                 slot,
+                page_type,
                 data,
+            } => {
+                buf.extend_from_slice(&page_id.to_le_bytes()); // 8
+                buf.extend_from_slice(&slot.to_le_bytes()); // 2
+                buf.push(*page_type); // 1
+                buf.extend_from_slice(&[0u8; 5]); // 5 padding
+                buf.extend_from_slice(data); // 64
+            }
+            Self::PageClear {
+                page_id,
+                slot,
+                page_type,
             } => {
                 buf.extend_from_slice(&page_id.to_le_bytes());
                 buf.extend_from_slice(&slot.to_le_bytes());
-                buf.extend_from_slice(&[0u8; 6]); // padding
-                buf.extend_from_slice(data);
-            }
-            Self::PageClear { page_id, slot } => {
-                buf.extend_from_slice(&page_id.to_le_bytes());
-                buf.extend_from_slice(&slot.to_le_bytes());
-                buf.extend_from_slice(&[0u8; 6]); // padding
+                buf.push(*page_type);
+                buf.extend_from_slice(&[0u8; 5]);
             }
         }
     }
@@ -121,21 +130,28 @@ impl WalBody {
                 }
                 let page_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let slot = u16::from_le_bytes(data[8..10].try_into().unwrap());
+                let page_type = data[10];
                 let mut rec_data = [0u8; RECORD_SIZE];
                 rec_data.copy_from_slice(&data[16..16 + RECORD_SIZE]);
                 Some(Self::PageWrite {
                     page_id,
                     slot,
+                    page_type,
                     data: rec_data,
                 })
             }
             WalRecordType::PageClear => {
-                if data.len() < 10 {
+                if data.len() < 11 {
                     return None;
                 }
                 let page_id = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let slot = u16::from_le_bytes(data[8..10].try_into().unwrap());
-                Some(Self::PageClear { page_id, slot })
+                let page_type = data[10];
+                Some(Self::PageClear {
+                    page_id,
+                    slot,
+                    page_type,
+                })
             }
         }
     }
@@ -208,7 +224,7 @@ impl WalWriter {
     }
 
     /// Flush the buffer to disk and sync.
-    pub fn flush(&mut self, io: &mut impl IoBackend) -> io::Result<()> {
+    pub fn flush(&mut self, io: &mut dyn IoBackend) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -259,7 +275,7 @@ impl WalReader {
 
     /// Read the next WAL record. Returns `None` at EOF or on a torn/partial
     /// record (which marks the end of the valid WAL).
-    pub fn next(&mut self, io: &mut impl IoBackend) -> Option<WalRecord> {
+    pub fn next(&mut self, io: &mut dyn IoBackend) -> Option<WalRecord> {
         // Need at least header + crc
         if self.offset + (WAL_HEADER_SIZE + WAL_CRC_SIZE) as u64 > self.file_size {
             return None;
@@ -371,6 +387,7 @@ mod tests {
             &WalBody::PageWrite {
                 page_id: 42,
                 slot: 7,
+                page_type: 1, // Node
                 data,
             },
         );
@@ -386,10 +403,12 @@ mod tests {
             WalBody::PageWrite {
                 page_id,
                 slot,
+                page_type,
                 data: d,
             } => {
                 assert_eq!(page_id, 42);
                 assert_eq!(slot, 7);
+                assert_eq!(page_type, 1);
                 assert_eq!(d[0], 0xAA);
                 assert_eq!(d[63], 0xBB);
             }
@@ -408,6 +427,7 @@ mod tests {
             &WalBody::PageClear {
                 page_id: 10,
                 slot: 99,
+                page_type: 2, // Edge
             },
         );
         writer.flush(&mut io).unwrap();
@@ -418,9 +438,14 @@ mod tests {
 
         assert_eq!(rec.record_type, WalRecordType::PageClear);
         match rec.body {
-            WalBody::PageClear { page_id, slot } => {
+            WalBody::PageClear {
+                page_id,
+                slot,
+                page_type,
+            } => {
                 assert_eq!(page_id, 10);
                 assert_eq!(slot, 99);
+                assert_eq!(page_type, 2);
             }
             _ => panic!("wrong body type"),
         }
@@ -474,6 +499,7 @@ mod tests {
                 &WalBody::PageWrite {
                     page_id: i,
                     slot: i as u16,
+                    page_type: 1,
                     data: [i as u8; RECORD_SIZE],
                 },
             );

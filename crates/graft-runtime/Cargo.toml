@@ -9,10 +9,13 @@ description = "Shard-per-core runtime: core pinning, message passing, event loop
 graft-core = { workspace = true }
 graft-query = { workspace = true }
 graft-storage = { workspace = true }
+graft-io = { workspace = true }
+graft-txn = { workspace = true }
 hashbrown = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "query"

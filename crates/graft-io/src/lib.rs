@@ -55,7 +55,20 @@ impl OpenOptions {
 /// In production this wraps real OS calls (`pread`/`pwrite`). In simulation
 /// everything is deterministic and injectable, enabling reproducible tests
 /// and fault injection.
-pub trait IoBackend {
+/// Create the best available I/O backend for the current platform.
+/// On Linux, returns `IoUringBackend`; elsewhere, returns `PosixIoBackend`.
+pub fn default_backend() -> Box<dyn IoBackend + Send> {
+    #[cfg(target_os = "linux")]
+    {
+        match IoUringBackend::new() {
+            Ok(b) => return Box::new(b),
+            Err(_) => {} // fall through to posix
+        }
+    }
+    Box::new(PosixIoBackend::new())
+}
+
+pub trait IoBackend: Send {
     // -- file lifecycle -----------------------------------------------------
 
     fn open(&mut self, path: &Path, opts: &OpenOptions) -> io::Result<FileHandle>;

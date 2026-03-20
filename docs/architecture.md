@@ -81,25 +81,38 @@ graft-cli           (depends on graft-core, graft-client)
 
 ## Runtime
 
-The runtime provides the `Database` API that wires parsing, planning, and execution together against a `Shard`.
+The runtime provides the execution environment for queries against sharded storage.
 
-### Phase 1 (current)
+### Shard
 
-- **Single shard** (shard 0), in-memory storage
-- `Database::query(gql) → Result<QueryResult>` — parses GQL, plans, executes
-- `Shard` implements `StorageAccess` with in-memory node/edge records
-- **Index-free adjacency**: each node carries `first_out_edge`/`first_in_edge` linked-list heads; each edge carries `next_out_edge`/`next_in_edge` pointers. Traversal follows the linked list — no index lookup.
-- **LabelDictionary**: bidirectional string ↔ `LabelId` mapping
-- Soft deletion (records marked deleted, skipped during scan/traversal)
-- Per-shard ID allocation with shard bits embedded in upper 8 bits of NodeId/EdgeId
+A `Shard` is the fundamental unit of data ownership. Each shard:
 
-### Future: Multi-shard
+- Implements `StorageAccess` for the query executor
+- Owns three buffer pools (node, edge, property pages) and a label dictionary
+- Maintains `HashMap` indexes for O(1) node/edge lookup by ID
+- Uses **index-free adjacency**: each node carries `first_out_edge`/`first_in_edge` linked-list heads; each edge carries `next_out_edge`/`next_in_edge` pointers
+- Tracks its own `TransactionManager` for MVCC (auto-commit, `is_record_visible()`)
+- Supports both ephemeral (in-memory) and durable (file-backed with WAL) modes
+- Accepts any `Box<dyn IoBackend + Send>` via `Shard::open_with_io()`
 
-- One OS thread per CPU core, pinned via `sched_setaffinity`
-- Each thread owns one shard — a complete, independent data partition
-- No locks in the hot path: each shard's data structures are single-threaded
-- Inter-shard communication via SPSC lock-free ring buffers
-- Single shared atomic: global commit counter (`AtomicU64`)
+### Database (test path)
+
+`Database` wraps multiple `Shard` instances in a single-threaded multi-shard setup:
+
+- Round-robin node creation across shards
+- NodeId/EdgeId shard routing via upper 8 bits
+- Cross-shard scan fan-out
+- `Database::query(gql)` — parses, plans, executes with auto-commit
+
+### ShardCluster (production path)
+
+`ShardCluster` is the thread-per-shard production executor:
+
+- Spawns N OS threads, each owning a `Shard`
+- Coordinator routes queries via SPSC lock-free ring buffers
+- Fan-out for scans, targeted routing for point lookups
+- Global tx_id via `AtomicU64`, routes `BeginTx/CommitTx/AbortTx` to all shard workers
+- `--shards` flag on server (defaults to CPU count)
 
 ### Event Loop (planned)
 
@@ -159,13 +172,13 @@ See [transactions.md](transactions.md) for full details. Summary:
 
 ## I/O Layer
 
-All I/O goes through the `IoBackend` trait:
+All I/O goes through the `IoBackend: Send` trait. `default_backend()` auto-selects the best backend for the platform.
 
 | Implementation | Purpose |
 |---|---|
 | `PosixIoBackend` | macOS/Linux development — uses `pread`/`pwrite` via `FileExt` |
 | `SimIoBackend` | Deterministic testing — in-memory filesystem with crash/fault injection |
-| `IoUringBackend` | Linux production — kernel-bypass I/O via `io_uring` |
+| `IoUringBackend` | Linux production — kernel-bypass I/O via `io_uring` with O_DIRECT |
 
 The trait covers:
 - File lifecycle: `open`, `close`, `sync`, `truncate`, `remove`
@@ -173,6 +186,15 @@ The trait covers:
 - Arbitrary byte I/O: `read_at`, `write_at` (for WAL)
 - Clock: `now_millis` (monotonic)
 - Entropy: `random_u64`
+
+### IoUringBackend
+
+- **O_DIRECT** for data files (`.dat`) — bypasses the kernel page cache since graft manages its own buffer pool
+- **fdatasync** for direct files, full fsync for buffered files (WAL)
+- **pread/pwrite** for WAL I/O — small sequential writes don't benefit from io_uring overhead
+- **EINVAL fallback** — if O_DIRECT fails (e.g. tmpfs), transparently falls back to buffered I/O
+- `.wal` files never use O_DIRECT (small sequential writes)
+- Ring size: 256 entries, synchronous submit-and-wait per operation (Phase 1)
 
 ### Simulation Testing
 
@@ -237,8 +259,9 @@ Client                    Server
 ### Server
 
 - `graft-server`: TCP server using `std::net`, one thread per connection
-- Shared `Database` behind `Arc<Mutex<Database>>` (Phase 1; per-shard routing later)
-- Configurable `--host` and `--port` via clap
+- Shared `ShardCluster` behind `Arc<Mutex<ShardCluster>>` — thread-per-shard execution
+- Configurable `--host`, `--port`, `--shards`, `--data-dir` via clap
+- Ephemeral mode (no `--data-dir`) or durable mode (with `--data-dir`)
 
 ### Client
 
@@ -300,19 +323,20 @@ This allows testing the query engine with an in-memory graph implementation, ind
 
 `IoUringBackend` (`graft-io/src/uring.rs`) implements `IoBackend` using Linux's `io_uring` for kernel-bypass I/O. Gated behind `#[cfg(target_os = "linux")]`.
 
-### Phase 1 (current)
+### Current Implementation
 
 - Synchronous submit-and-wait pattern: one SQE submitted, one CQE waited per operation
-- Page-aligned I/O for `read_page`/`write_page` (8 KB, direct to NVMe)
-- WAL I/O (`read_at`/`write_at`) uses `pread`/`pwrite` (arbitrary byte offsets)
+- **O_DIRECT** for data files — bypasses kernel page cache (graft manages its own buffer pool)
+- `.wal` files use buffered I/O with pread/pwrite (small sequential writes)
+- **fdatasync** for O_DIRECT files (skips metadata update), full fsync for buffered files
+- EINVAL fallback — gracefully handles filesystems that don't support O_DIRECT (e.g. tmpfs)
 - Ring size: 256 entries
-- `fsync` via io_uring `Fsync` opcode
+- `Shard::open()` auto-selects io_uring on Linux via `default_backend()`
 
 ### Future: Batched Async
 
 - Submit multiple SQEs per event loop iteration
 - Completion-driven execution: `poll_io()` drains CQEs, wakes waiting queries
-- Direct I/O (`O_DIRECT`) for zero-copy page reads/writes
 
 ## Benchmarks
 

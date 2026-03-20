@@ -59,7 +59,18 @@ fn is_visible(&self, tx_min: TxId, tx_max: TxId) -> bool {
 
 ### Own Writes
 
-A transaction's own writes have `tx_min == ts`. Since the visibility check requires `tx_min < ts` (strict less-than), own writes are **not** visible through the snapshot. This is by design — the executor layer will handle own-write visibility separately, which avoids complicating the snapshot logic.
+A transaction's own writes have `tx_min == current_tx`. Since the snapshot's `is_visible()` requires `tx_min < ts` (strict less-than), own writes are **not** visible through the snapshot alone.
+
+The `Shard::is_record_visible()` method handles own-writes as a special case **before** consulting the snapshot:
+
+```rust
+// Own writes: tx_min == current_tx → visible (unless also deleted by current_tx)
+if tx_min == self.current_tx {
+    return tx_max == 0 || tx_max != self.current_tx;
+}
+```
+
+This keeps the `Snapshot` logic simple while ensuring within-transaction reads see the transaction's own writes.
 
 ## Conflict Detection
 
@@ -175,14 +186,23 @@ This batching amortizes the cost of `fsync` across multiple transactions.
 
 ### Recovery
 
-`WalReader` scans the WAL sequentially from the beginning:
+WAL recovery uses a **two-pass** approach for transaction awareness:
 
-1. Read the 20-byte header
-2. Read the body (length from header)
-3. Read the 4-byte CRC
-4. Verify CRC — if invalid, treat as end of valid WAL (torn write)
+**Pass 1 — Build committed transaction set:**
+1. Scan the entire WAL sequentially
+2. Collect all tx_ids that have a `Commit` record
+3. Track the maximum tx_id seen (for `advance_past()`)
 
-A corrupt or truncated record is treated as the end of the valid log. All records before it are valid; everything after is discarded. This handles the case where a crash interrupted a write.
+**Pass 2 — Replay committed writes only:**
+1. Scan the WAL again from the beginning
+2. For each `PageWrite`/`PageClear` record:
+   - If `tx_id == 0` (pre-MVCC), replay unconditionally
+   - If `tx_id` is in the committed set, replay
+   - Otherwise, skip (transaction was active/aborted at crash time)
+
+`WalReader` scans sequentially — reads the 20-byte header, body, and 4-byte CRC. A corrupt or truncated record is treated as the end of the valid log. All records before it are valid; everything after is discarded.
+
+After replay, `TransactionManager::advance_past(max_tx_id)` ensures new transactions don't collide with recovered ones and sets `base_tx_id` for post-recovery visibility.
 
 ### Checkpoints (planned)
 
@@ -197,13 +217,32 @@ The `TransactionManager` is the central coordinator for transaction lifecycle wi
 | Field | Type | Purpose |
 |---|---|---|
 | `next_tx_id` | `TxId` | Next ID to assign (starts at 1; 0 is NULL) |
+| `base_tx_id` | `TxId` | Starting tx_id for this session (tx_ids below this are from previous sessions, treated as committed) |
 | `active` | `HashMap<TxId, Transaction>` | Currently active transactions |
-| `committed_writes` | `HashMap<(PageId, u16), TxId>` | Last committer per (page, slot) |
-| `committed_set` | `HashSet<TxId>` | Set of committed TxIds |
+| `committed_writes` | `HashMap<(PageId, u16), TxId>` | Last committer per (page, slot) — pruned below low-water |
+| `committed_set` | `HashSet<TxId>` | Set of committed TxIds — NOT pruned (needed for MVCC visibility) |
 | `low_water` | `TxId` | Oldest active snapshot timestamp |
 
 ### Low-Water Mark Pruning
 
-When a transaction commits or aborts, the low-water mark is recomputed as the minimum `snapshot.ts` among all active transactions. `committed_writes` and `committed_set` entries below the low-water mark are pruned — they are no longer needed because all active transactions can already see them.
+When a transaction commits or aborts, the low-water mark is recomputed as the minimum `snapshot.ts` among all active transactions. `committed_writes` entries below the low-water mark are pruned — they are no longer needed for conflict detection.
 
-This bounds memory usage: the bookkeeping structures grow proportionally to the number of concurrent transactions and recent commits, not the total history.
+**Note:** `committed_set` is intentionally **not** pruned. It is needed for MVCC visibility checks (`was_committed()`) — a record's `tx_min` may reference a committed transaction that is below the low-water mark, and `is_record_visible()` must still be able to confirm it committed (rather than was aborted). A future optimization can replace `committed_set` with a high-water mark once all transactions below it are guaranteed committed.
+
+### Post-Recovery Visibility
+
+After WAL recovery, the `TransactionManager` uses `base_tx_id` (set by `advance_past()`) to recognize transactions from previous sessions. `was_committed(tx_id)` returns `true` if `tx_id < base_tx_id`, since two-pass WAL recovery ensures only committed writes survive.
+
+### Auto-Commit
+
+Every query is implicitly wrapped in a transaction by the executor:
+
+```
+begin_tx() → execute query → commit_tx() (or abort_tx() on error)
+```
+
+`StorageAccess` provides `begin_tx/commit_tx/abort_tx` methods (default no-ops for backward compatibility). `ShardCluster` generates a global `tx_id` via `AtomicU64` and routes `BeginTx/CommitTx/AbortTx` to all shard workers.
+
+### Edge Chain Traversal with MVCC
+
+When traversing edge chains (outbound/inbound linked lists), invisible edges must be skipped without breaking the chain. The shard reads raw edge records to get next pointers (`next_out_edge`/`next_in_edge`), then checks visibility separately. This ensures that an invisible edge mid-chain still provides the pointer to the next edge.

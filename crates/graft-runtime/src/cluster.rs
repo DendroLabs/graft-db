@@ -1,11 +1,12 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 
-use graft_core::{EdgeId, NodeId, ShardId};
+use graft_core::{EdgeId, NodeId, ShardId, TxId};
 use graft_query::executor::{EdgeInfo, NodeInfo, StorageAccess, Value};
 use graft_query::{self, QueryResult};
 
-use crate::shard::Shard;
+use crate::shard::{Shard, ShardConfig};
 use crate::spsc;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,12 @@ enum Request {
     DeleteEdge {
         edge_id: EdgeId,
     },
+    BeginTx {
+        tx_id: TxId,
+    },
+    CommitTx,
+    AbortTx,
+    Flush,
     Shutdown,
 }
 
@@ -110,6 +117,10 @@ impl ShardWorker {
 
     fn handle(&mut self, req: Request) -> Response {
         match req {
+            Request::Flush => {
+                let _ = self.shard.flush();
+                Response::Done
+            }
             Request::ScanNodes { label } => {
                 Response::Nodes(self.shard.scan_nodes(label.as_deref()))
             }
@@ -165,6 +176,18 @@ impl ShardWorker {
                 self.shard.delete_edge(edge_id);
                 Response::Done
             }
+            Request::BeginTx { tx_id } => {
+                self.shard.begin_tx_with_id(tx_id);
+                Response::Done
+            }
+            Request::CommitTx => {
+                self.shard.commit_current_tx();
+                Response::Done
+            }
+            Request::AbortTx => {
+                self.shard.abort_current_tx();
+                Response::Done
+            }
             Request::Shutdown => unreachable!("handled in run()"),
         }
     }
@@ -206,6 +229,15 @@ impl ShardHandle {
 
 impl Drop for ShardHandle {
     fn drop(&mut self) {
+        // Flush before shutdown so durable shards persist their data
+        let _ = self.request_tx.push(Request::Flush);
+        // Wait for flush response
+        loop {
+            match self.response_rx.pop() {
+                Some(_) => break,
+                None => std::hint::spin_loop(),
+            }
+        }
         // Send shutdown and wait for thread to exit
         let _ = self.request_tx.push(Request::Shutdown);
         if let Some(handle) = self.thread.take() {
@@ -236,6 +268,8 @@ impl Drop for ShardHandle {
 pub struct ShardCluster {
     handles: Vec<ShardHandle>,
     next_shard: AtomicU8,
+    next_tx_id: AtomicU64,
+    current_tx: TxId,
 }
 
 impl ShardCluster {
@@ -275,6 +309,70 @@ impl ShardCluster {
         Self {
             handles,
             next_shard: AtomicU8::new(0),
+            next_tx_id: AtomicU64::new(1),
+            current_tx: 0,
+        }
+    }
+
+    /// Spawn a cluster with `n` durable shard worker threads backed by files
+    /// in `data_dir`. Creates or recovers shards from disk.
+    pub fn open(n: usize, data_dir: &Path) -> std::io::Result<Self> {
+        assert!((1..=256).contains(&n), "shard count must be 1..=256");
+
+        // First, open all shards and find the max tx_id for global counter
+        let mut shards = Vec::with_capacity(n);
+        let mut max_tx: TxId = 0;
+        for i in 0..n {
+            let shard_id = i as ShardId;
+            let config = ShardConfig {
+                data_dir: data_dir.to_owned(),
+                pool_capacity: 1024,
+            };
+            let shard = Shard::open(shard_id, &config)?;
+            let shard_tx = shard.next_local_tx();
+            if shard_tx > max_tx {
+                max_tx = shard_tx;
+            }
+            shards.push(shard);
+        }
+
+        // Now spawn worker threads
+        let mut handles = Vec::with_capacity(n);
+        for shard in shards {
+            let shard_id = shard.shard_id();
+            let (req_tx, req_rx) = spsc::channel::<Request>(4096);
+            let (resp_tx, resp_rx) = spsc::channel::<Response>(4096);
+
+            let worker = ShardWorker {
+                shard,
+                requests: req_rx,
+                responses: resp_tx,
+            };
+
+            let thread = thread::Builder::new()
+                .name(format!("graft-shard-{shard_id}"))
+                .spawn(move || worker.run())
+                .expect("failed to spawn shard thread");
+
+            handles.push(ShardHandle {
+                request_tx: req_tx,
+                response_rx: resp_rx,
+                thread: Some(thread),
+            });
+        }
+
+        Ok(Self {
+            handles,
+            next_shard: AtomicU8::new(0),
+            next_tx_id: AtomicU64::new(max_tx),
+            current_tx: 0,
+        })
+    }
+
+    /// Flush all shards to disk. Each shard flushes its WAL and dirty pages.
+    pub fn flush(&self) {
+        for handle in &self.handles {
+            handle.call(Request::Flush);
         }
     }
 
@@ -476,6 +574,29 @@ impl StorageAccess for ShardCluster {
     fn delete_edge(&mut self, id: EdgeId) {
         self.shard_for_edge(id).call(Request::DeleteEdge { edge_id: id });
     }
+
+    fn begin_tx(&mut self) -> u64 {
+        let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
+        self.current_tx = tx_id;
+        for handle in &self.handles {
+            handle.call(Request::BeginTx { tx_id });
+        }
+        tx_id
+    }
+
+    fn commit_tx(&mut self) {
+        for handle in &self.handles {
+            handle.call(Request::CommitTx);
+        }
+        self.current_tx = 0;
+    }
+
+    fn abort_tx(&mut self) {
+        for handle in &self.handles {
+            handle.call(Request::AbortTx);
+        }
+        self.current_tx = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +606,7 @@ impl StorageAccess for ShardCluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graft_query::executor::Value;
 
     #[test]
     fn single_shard_cluster_basic() {
@@ -669,11 +791,68 @@ mod tests {
     }
 
     #[test]
+    fn cluster_auto_commit() {
+        // Queries through ShardCluster get proper tx wrapping
+        let mut cluster = ShardCluster::new(2);
+
+        // Each query should auto-commit
+        cluster.query("CREATE (:Person {name: 'Alice'})").unwrap();
+        cluster.query("CREATE (:Person {name: 'Bob'})").unwrap();
+
+        // Read should see both committed records
+        let result = cluster
+            .query("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Value::String("Alice".into()));
+        assert_eq!(result.rows[1][0], Value::String("Bob".into()));
+
+        // Delete one and verify
+        cluster.query("MATCH (p:Person {name: 'Alice'}) DELETE p").unwrap();
+
+        let result = cluster
+            .query("MATCH (p:Person) RETURN p.name")
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::String("Bob".into()));
+    }
+
+    #[test]
     fn cluster_graceful_shutdown() {
         // Verify cluster shuts down cleanly when dropped
         let mut cluster = ShardCluster::new(4);
         cluster.query("CREATE (:N {v: 1})").unwrap();
         drop(cluster);
         // If we get here without hanging, shutdown works
+    }
+
+    #[test]
+    fn cluster_open_and_recover() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create data in a durable cluster
+        {
+            let mut cluster = ShardCluster::open(2, dir.path()).unwrap();
+            cluster.query("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
+            cluster.query("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
+            cluster.query("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2024}]->(b)").unwrap();
+            // Drop triggers flush via ShardHandle::drop
+        }
+
+        // Re-open and verify all data survived
+        {
+            let mut cluster = ShardCluster::open(2, dir.path()).unwrap();
+
+            let result = cluster.query("MATCH (n:Person) RETURN n.name ORDER BY n.name").unwrap();
+            assert_eq!(result.rows.len(), 2);
+            assert_eq!(result.rows[0][0], Value::String("Alice".into()));
+            assert_eq!(result.rows[1][0], Value::String("Bob".into()));
+
+            let result = cluster.query("MATCH (a)-[e:KNOWS]->(b) RETURN a.name, e.since, b.name").unwrap();
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0], Value::String("Alice".into()));
+            assert_eq!(result.rows[0][1], Value::Int(2024));
+            assert_eq!(result.rows[0][2], Value::String("Bob".into()));
+        }
     }
 }

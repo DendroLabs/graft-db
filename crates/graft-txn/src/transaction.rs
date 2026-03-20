@@ -36,6 +36,9 @@ pub struct Transaction {
 /// commit succeeds — the others get a `WriteConflict` error.
 pub struct TransactionManager {
     next_tx_id: TxId,
+    /// The tx_id the TM started at. Any tx_id < this from a previous session
+    /// is treated as committed (survived recovery).
+    base_tx_id: TxId,
     active: HashMap<TxId, Transaction>,
     /// For conflict detection: maps `(page_id, slot)` to the TxId that last
     /// committed a write. Entries older than the oldest active snapshot can
@@ -53,6 +56,7 @@ impl TransactionManager {
     pub fn new() -> Self {
         Self {
             next_tx_id: 1, // TxId 0 is reserved (NULL sentinel)
+            base_tx_id: 0, // No previous session — nothing pre-committed
             active: HashMap::new(),
             committed_writes: HashMap::new(),
             committed_set: HashSet::new(),
@@ -61,9 +65,18 @@ impl TransactionManager {
     }
 
     /// Begin a new transaction, returning its ID.
-    pub fn begin(&mut self, wal: &mut WalWriter) -> TxId {
+    pub fn begin(&mut self, wal: Option<&mut WalWriter>) -> TxId {
         let tx_id = self.next_tx_id;
         self.next_tx_id += 1;
+        self.begin_with_id(tx_id, wal)
+    }
+
+    /// Begin a transaction with a specific, externally-assigned tx_id.
+    /// Advances internal counter past this id if needed.
+    pub fn begin_with_id(&mut self, tx_id: TxId, wal: Option<&mut WalWriter>) -> TxId {
+        if tx_id >= self.next_tx_id {
+            self.next_tx_id = tx_id + 1;
+        }
 
         let snapshot = Snapshot {
             ts: tx_id,
@@ -77,7 +90,9 @@ impl TransactionManager {
             write_set: Vec::new(),
         };
 
-        wal.append(tx_id, WalRecordType::Begin, &WalBody::Empty);
+        if let Some(wal) = wal {
+            wal.append(tx_id, WalRecordType::Begin, &WalBody::Empty);
+        }
         self.active.insert(tx_id, tx);
         tx_id
     }
@@ -95,8 +110,8 @@ impl TransactionManager {
     pub fn commit(
         &mut self,
         tx_id: TxId,
-        wal: &mut WalWriter,
-        io: &mut impl IoBackend,
+        wal: Option<&mut WalWriter>,
+        io: Option<&mut dyn IoBackend>,
     ) -> Result<()> {
         let tx = self
             .active
@@ -120,8 +135,10 @@ impl TransactionManager {
         }
 
         // No conflicts — commit
-        wal.append(tx_id, WalRecordType::Commit, &WalBody::Empty);
-        wal.flush(io).map_err(Error::Io)?;
+        if let (Some(wal), Some(io)) = (wal, io) {
+            wal.append(tx_id, WalRecordType::Commit, &WalBody::Empty);
+            wal.flush(io).map_err(Error::Io)?;
+        }
 
         // Update bookkeeping
         let tx = self.active.remove(&tx_id).unwrap();
@@ -136,8 +153,10 @@ impl TransactionManager {
 
     /// Abort a transaction. Its writes are discarded (MVCC: records with
     /// tx_min = this tx_id will be invisible to all snapshots).
-    pub fn abort(&mut self, tx_id: TxId, wal: &mut WalWriter) {
-        wal.append(tx_id, WalRecordType::Abort, &WalBody::Empty);
+    pub fn abort(&mut self, tx_id: TxId, wal: Option<&mut WalWriter>) {
+        if let Some(wal) = wal {
+            wal.append(tx_id, WalRecordType::Abort, &WalBody::Empty);
+        }
         self.active.remove(&tx_id);
         self.update_low_water();
     }
@@ -152,9 +171,33 @@ impl TransactionManager {
         self.committed_set.contains(&tx_id)
     }
 
+    /// Check if a transaction was committed. Handles three cases:
+    /// 1. tx_id is in the current session's committed_set → true
+    /// 2. tx_id < base_tx_id → from a previous session, survived recovery → true
+    /// 3. tx_id is active or was aborted in this session → false
+    pub fn was_committed(&self, tx_id: TxId) -> bool {
+        if tx_id < self.base_tx_id {
+            // From a previous session — all surviving records are committed
+            // (two-pass WAL replay ensures uncommitted records are discarded)
+            return true;
+        }
+        self.committed_set.contains(&tx_id)
+    }
+
     /// The next TxId that will be assigned.
     pub fn next_tx_id(&self) -> TxId {
         self.next_tx_id
+    }
+
+    /// Advance the next_tx_id if `id` is >= current next. Used after
+    /// recovery to ensure new transactions don't collide with old ones.
+    /// Also updates base_tx_id so records from previous sessions are
+    /// recognized as committed.
+    pub fn advance_past(&mut self, id: TxId) {
+        if id >= self.next_tx_id {
+            self.next_tx_id = id + 1;
+            self.base_tx_id = id + 1;
+        }
     }
 
     /// Number of currently active transactions.
@@ -173,9 +216,12 @@ impl TransactionManager {
             .unwrap_or(self.next_tx_id);
 
         if new_low > self.low_water {
-            // Prune committed_writes and committed_set below the low-water mark
+            // Prune committed_writes below the low-water mark (conflict detection only)
             self.committed_writes.retain(|_, &mut tx| tx >= self.low_water);
-            self.committed_set.retain(|&tx| tx >= self.low_water);
+            // Note: committed_set is NOT pruned — it's needed for MVCC
+            // visibility checks (was_committed). A future optimization can
+            // replace it with a high-water mark once all txs below it are
+            // guaranteed committed.
             self.low_water = new_low;
         }
     }
@@ -208,10 +254,10 @@ mod tests {
     #[test]
     fn begin_and_commit() {
         let (mut io, _, mut wal, mut tm) = setup();
-        let tx = tm.begin(&mut wal);
+        let tx = tm.begin(Some(&mut wal));
         assert_eq!(tm.active_count(), 1);
 
-        tm.commit(tx, &mut wal, &mut io).unwrap();
+        tm.commit(tx, Some(&mut wal), Some(&mut io)).unwrap();
         assert_eq!(tm.active_count(), 0);
         assert!(tm.is_committed(tx));
     }
@@ -219,8 +265,8 @@ mod tests {
     #[test]
     fn begin_and_abort() {
         let (_, _, mut wal, mut tm) = setup();
-        let tx = tm.begin(&mut wal);
-        tm.abort(tx, &mut wal);
+        let tx = tm.begin(Some(&mut wal));
+        tm.abort(tx, Some(&mut wal));
         assert_eq!(tm.active_count(), 0);
         assert!(!tm.is_committed(tx));
     }
@@ -228,15 +274,15 @@ mod tests {
     #[test]
     fn commit_inactive_tx_errors() {
         let (mut io, _, mut wal, mut tm) = setup();
-        let result = tm.commit(999, &mut wal, &mut io);
+        let result = tm.commit(999, Some(&mut wal), Some(&mut io));
         assert!(result.is_err());
     }
 
     #[test]
     fn snapshot_captures_active_set() {
         let (_, _, mut wal, mut tm) = setup();
-        let tx1 = tm.begin(&mut wal);
-        let tx2 = tm.begin(&mut wal);
+        let tx1 = tm.begin(Some(&mut wal));
+        let tx2 = tm.begin(Some(&mut wal));
 
         let snap = tm.snapshot(tx2).unwrap();
         assert!(snap.active.contains(&tx1));
@@ -252,32 +298,32 @@ mod tests {
     fn no_conflict_disjoint_writes() {
         let (mut io, _, mut wal, mut tm) = setup();
 
-        let tx1 = tm.begin(&mut wal);
-        let tx2 = tm.begin(&mut wal);
+        let tx1 = tm.begin(Some(&mut wal));
+        let tx2 = tm.begin(Some(&mut wal));
 
         tm.record_write(tx1, 1, 0);
         tm.record_write(tx2, 2, 0); // different page
 
-        tm.commit(tx1, &mut wal, &mut io).unwrap();
-        tm.commit(tx2, &mut wal, &mut io).unwrap(); // no conflict
+        tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
+        tm.commit(tx2, Some(&mut wal), Some(&mut io)).unwrap(); // no conflict
     }
 
     #[test]
     fn first_committer_wins() {
         let (mut io, _, mut wal, mut tm) = setup();
 
-        let tx1 = tm.begin(&mut wal);
-        let tx2 = tm.begin(&mut wal);
+        let tx1 = tm.begin(Some(&mut wal));
+        let tx2 = tm.begin(Some(&mut wal));
 
         // Both write to same (page, slot)
         tm.record_write(tx1, 1, 0);
         tm.record_write(tx2, 1, 0);
 
         // tx1 commits first — succeeds
-        tm.commit(tx1, &mut wal, &mut io).unwrap();
+        tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
 
         // tx2 tries to commit — conflict!
-        let result = tm.commit(tx2, &mut wal, &mut io);
+        let result = tm.commit(tx2, Some(&mut wal), Some(&mut io));
         assert!(matches!(result, Err(Error::WriteConflict(_))));
     }
 
@@ -286,16 +332,16 @@ mod tests {
         let (mut io, _, mut wal, mut tm) = setup();
 
         // tx1 writes and commits BEFORE tx2 starts
-        let tx1 = tm.begin(&mut wal);
+        let tx1 = tm.begin(Some(&mut wal));
         tm.record_write(tx1, 1, 0);
-        tm.commit(tx1, &mut wal, &mut io).unwrap();
+        tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
 
         // tx2 starts after tx1 committed — its snapshot includes tx1
-        let tx2 = tm.begin(&mut wal);
+        let tx2 = tm.begin(Some(&mut wal));
         tm.record_write(tx2, 1, 0); // same slot, but tx1 already committed
 
         // No conflict because tx1 committed before tx2's snapshot
-        tm.commit(tx2, &mut wal, &mut io).unwrap();
+        tm.commit(tx2, Some(&mut wal), Some(&mut io)).unwrap();
     }
 
     #[test]
@@ -303,9 +349,9 @@ mod tests {
         let (mut io, _, mut wal, mut tm) = setup();
 
         for _ in 0..20 {
-            let tx = tm.begin(&mut wal);
+            let tx = tm.begin(Some(&mut wal));
             tm.record_write(tx, 1, 0);
-            tm.commit(tx, &mut wal, &mut io).unwrap();
+            tm.commit(tx, Some(&mut wal), Some(&mut io)).unwrap();
         }
 
         // With no active transactions, low water should have advanced,

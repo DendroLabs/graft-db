@@ -548,9 +548,12 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "graft-core",
+ "graft-io",
  "graft-query",
  "graft-storage",
+ "graft-txn",
  "hashbrown 0.15.5",
+ "tempfile",
 ]
 
 [[package]]

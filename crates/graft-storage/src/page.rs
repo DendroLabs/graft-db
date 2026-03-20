@@ -15,6 +15,7 @@ pub enum PageType {
     Node = 1,
     Edge = 2,
     PropertyOverflow = 3,
+    Label = 4,
 }
 
 impl PageType {
@@ -24,7 +25,18 @@ impl PageType {
             1 => Some(Self::Node),
             2 => Some(Self::Edge),
             3 => Some(Self::PropertyOverflow),
+            4 => Some(Self::Label),
             _ => None,
+        }
+    }
+
+    /// Read the page type directly from a raw page buffer without
+    /// constructing a full `Page`.
+    pub fn from_page_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() > OFF_PAGE_TYPE {
+            Self::from_u8(data[OFF_PAGE_TYPE])
+        } else {
+            None
         }
     }
 }
@@ -193,6 +205,20 @@ impl Page {
     pub fn update_checksum(&mut self) {
         let crc = self.compute_checksum();
         self.data[OFF_CHECKSUM..OFF_CHECKSUM + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Return the indices of all occupied (non-free) slots.
+    pub fn occupied_slots(&self) -> Vec<u16> {
+        let mut is_free = [false; RECORDS_PER_PAGE];
+        let mut slot = self.free_head();
+        while slot != SLOT_NONE && (slot as usize) < RECORDS_PER_PAGE {
+            is_free[slot as usize] = true;
+            let off = Self::slot_offset(slot);
+            slot = u16::from_le_bytes(self.data[off..off + 2].try_into().unwrap());
+        }
+        (0..RECORDS_PER_PAGE as u16)
+            .filter(|&s| !is_free[s as usize])
+            .collect()
     }
 
     // -- raw access ---------------------------------------------------------

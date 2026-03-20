@@ -1,4 +1,4 @@
-use graft_core::{EdgeId, NodeId, ShardId};
+use graft_core::{EdgeId, NodeId, ShardId, TxId};
 use graft_query::executor::{EdgeInfo, NodeInfo, StorageAccess, Value};
 use graft_query::{self, QueryResult};
 
@@ -12,6 +12,8 @@ use crate::shard::Shard;
 pub struct Database {
     shards: Vec<Shard>,
     next_shard: ShardId,
+    next_tx_id: TxId,
+    current_tx: TxId,
 }
 
 impl Database {
@@ -27,6 +29,8 @@ impl Database {
         Self {
             shards,
             next_shard: 0,
+            next_tx_id: 1,
+            current_tx: 0,
         }
     }
 
@@ -156,6 +160,30 @@ impl StorageAccess for Database {
 
     fn delete_edge(&mut self, id: EdgeId) {
         self.shard_for_edge_mut(id).delete_edge(id);
+    }
+
+    fn begin_tx(&mut self) -> u64 {
+        let tx_id = self.next_tx_id;
+        self.next_tx_id += 1;
+        self.current_tx = tx_id;
+        for shard in &mut self.shards {
+            shard.begin_tx_with_id(tx_id);
+        }
+        tx_id
+    }
+
+    fn commit_tx(&mut self) {
+        for shard in &mut self.shards {
+            shard.commit_current_tx();
+        }
+        self.current_tx = 0;
+    }
+
+    fn abort_tx(&mut self) {
+        for shard in &mut self.shards {
+            shard.abort_current_tx();
+        }
+        self.current_tx = 0;
     }
 }
 

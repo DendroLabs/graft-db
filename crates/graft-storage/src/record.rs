@@ -180,6 +180,197 @@ impl EdgeRecord {
 }
 
 // ---------------------------------------------------------------------------
+// PropertyRecord — 64 bytes
+// ---------------------------------------------------------------------------
+//
+// Offset  Size  Field
+// 0       8     entity_id (u64)
+// 8       1     entity_type (0=node, 1=edge)
+// 9       1     key_len (max 23)
+// 10      23    key (UTF-8)
+// 33      1     value_type (0=Null, 1=Int, 2=Float, 3=String, 4=Bool)
+// 34      30    value_data
+//
+// For String values: value_data[0] = strlen, value_data[1..1+strlen] = UTF-8
+
+pub const PROP_KEY_MAX: usize = 23;
+pub const PROP_VALUE_DATA_SIZE: usize = 30;
+
+pub const VALUE_TYPE_NULL: u8 = 0;
+pub const VALUE_TYPE_INT: u8 = 1;
+pub const VALUE_TYPE_FLOAT: u8 = 2;
+pub const VALUE_TYPE_STRING: u8 = 3;
+pub const VALUE_TYPE_BOOL: u8 = 4;
+
+pub const ENTITY_TYPE_NODE: u8 = 0;
+pub const ENTITY_TYPE_EDGE: u8 = 1;
+
+#[derive(Clone, Debug)]
+pub struct PropertyRecord {
+    pub entity_id: u64,
+    pub entity_type: u8,
+    pub key: String,
+    pub value_type: u8,
+    pub value_data: [u8; PROP_VALUE_DATA_SIZE],
+}
+
+impl PropertyRecord {
+    pub fn new_null(entity_id: u64, entity_type: u8, key: &str) -> Self {
+        assert!(
+            key.len() <= PROP_KEY_MAX,
+            "property key too long: {} bytes (max {PROP_KEY_MAX})",
+            key.len()
+        );
+        Self {
+            entity_id,
+            entity_type,
+            key: key.to_owned(),
+            value_type: VALUE_TYPE_NULL,
+            value_data: [0; PROP_VALUE_DATA_SIZE],
+        }
+    }
+
+    pub fn new_int(entity_id: u64, entity_type: u8, key: &str, value: i64) -> Self {
+        assert!(key.len() <= PROP_KEY_MAX);
+        let mut data = [0u8; PROP_VALUE_DATA_SIZE];
+        data[0..8].copy_from_slice(&value.to_le_bytes());
+        Self {
+            entity_id,
+            entity_type,
+            key: key.to_owned(),
+            value_type: VALUE_TYPE_INT,
+            value_data: data,
+        }
+    }
+
+    pub fn new_float(entity_id: u64, entity_type: u8, key: &str, value: f64) -> Self {
+        assert!(key.len() <= PROP_KEY_MAX);
+        let mut data = [0u8; PROP_VALUE_DATA_SIZE];
+        data[0..8].copy_from_slice(&value.to_le_bytes());
+        Self {
+            entity_id,
+            entity_type,
+            key: key.to_owned(),
+            value_type: VALUE_TYPE_FLOAT,
+            value_data: data,
+        }
+    }
+
+    pub fn new_string(entity_id: u64, entity_type: u8, key: &str, value: &str) -> Self {
+        assert!(key.len() <= PROP_KEY_MAX);
+        let bytes = value.as_bytes();
+        assert!(
+            bytes.len() < PROP_VALUE_DATA_SIZE,
+            "property string value too long: {} bytes (max {})",
+            bytes.len(),
+            PROP_VALUE_DATA_SIZE - 1
+        );
+        let mut data = [0u8; PROP_VALUE_DATA_SIZE];
+        data[0] = bytes.len() as u8;
+        data[1..1 + bytes.len()].copy_from_slice(bytes);
+        Self {
+            entity_id,
+            entity_type,
+            key: key.to_owned(),
+            value_type: VALUE_TYPE_STRING,
+            value_data: data,
+        }
+    }
+
+    pub fn new_bool(entity_id: u64, entity_type: u8, key: &str, value: bool) -> Self {
+        assert!(key.len() <= PROP_KEY_MAX);
+        let mut data = [0u8; PROP_VALUE_DATA_SIZE];
+        data[0] = u8::from(value);
+        Self {
+            entity_id,
+            entity_type,
+            key: key.to_owned(),
+            value_type: VALUE_TYPE_BOOL,
+            value_data: data,
+        }
+    }
+
+    pub fn int_value(&self) -> Option<i64> {
+        if self.value_type == VALUE_TYPE_INT {
+            Some(i64::from_le_bytes(self.value_data[0..8].try_into().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    pub fn float_value(&self) -> Option<f64> {
+        if self.value_type == VALUE_TYPE_FLOAT {
+            Some(f64::from_le_bytes(self.value_data[0..8].try_into().unwrap()))
+        } else {
+            None
+        }
+    }
+
+    pub fn string_value(&self) -> Option<String> {
+        if self.value_type == VALUE_TYPE_STRING {
+            let len = self.value_data[0] as usize;
+            Some(
+                String::from_utf8_lossy(&self.value_data[1..1 + len]).into_owned(),
+            )
+        } else {
+            None
+        }
+    }
+
+    pub fn bool_value(&self) -> Option<bool> {
+        if self.value_type == VALUE_TYPE_BOOL {
+            Some(self.value_data[0] != 0)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.value_type == VALUE_TYPE_NULL
+    }
+
+    pub fn read_from(buf: &[u8]) -> Self {
+        debug_assert!(buf.len() >= RECORD_SIZE);
+        let entity_id = r_u64(buf, 0);
+        let entity_type = buf[8];
+        let key_len = buf[9] as usize;
+        let key_len = key_len.min(PROP_KEY_MAX);
+        let key = std::str::from_utf8(&buf[10..10 + key_len])
+            .unwrap_or("")
+            .to_owned();
+        let value_type = buf[33];
+        let mut value_data = [0u8; PROP_VALUE_DATA_SIZE];
+        value_data.copy_from_slice(&buf[34..64]);
+        Self {
+            entity_id,
+            entity_type,
+            key,
+            value_type,
+            value_data,
+        }
+    }
+
+    pub fn write_to(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= RECORD_SIZE);
+        buf[..RECORD_SIZE].fill(0);
+        w_u64(buf, 0, self.entity_id);
+        buf[8] = self.entity_type;
+        let key_bytes = self.key.as_bytes();
+        let key_len = key_bytes.len().min(PROP_KEY_MAX);
+        buf[9] = key_len as u8;
+        buf[10..10 + key_len].copy_from_slice(&key_bytes[..key_len]);
+        buf[33] = self.value_type;
+        buf[34..64].copy_from_slice(&self.value_data);
+    }
+
+    pub fn to_bytes(&self) -> [u8; RECORD_SIZE] {
+        let mut buf = [0u8; RECORD_SIZE];
+        self.write_to(&mut buf);
+        buf
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Little-endian helpers
 // ---------------------------------------------------------------------------
 
@@ -280,5 +471,51 @@ mod tests {
         assert!(!rec.is_deleted());
         rec.tx_max = 5;
         assert!(rec.is_deleted());
+    }
+
+    #[test]
+    fn property_record_int_round_trip() {
+        let rec = PropertyRecord::new_int(42, ENTITY_TYPE_NODE, "age", 30);
+        let bytes = rec.to_bytes();
+        let rec2 = PropertyRecord::read_from(&bytes);
+        assert_eq!(rec2.entity_id, 42);
+        assert_eq!(rec2.entity_type, ENTITY_TYPE_NODE);
+        assert_eq!(rec2.key, "age");
+        assert_eq!(rec2.int_value(), Some(30));
+    }
+
+    #[test]
+    fn property_record_string_round_trip() {
+        let rec = PropertyRecord::new_string(7, ENTITY_TYPE_EDGE, "name", "Alice");
+        let bytes = rec.to_bytes();
+        let rec2 = PropertyRecord::read_from(&bytes);
+        assert_eq!(rec2.entity_id, 7);
+        assert_eq!(rec2.entity_type, ENTITY_TYPE_EDGE);
+        assert_eq!(rec2.key, "name");
+        assert_eq!(rec2.string_value(), Some("Alice".into()));
+    }
+
+    #[test]
+    fn property_record_bool_round_trip() {
+        let rec = PropertyRecord::new_bool(1, ENTITY_TYPE_NODE, "active", true);
+        let bytes = rec.to_bytes();
+        let rec2 = PropertyRecord::read_from(&bytes);
+        assert_eq!(rec2.bool_value(), Some(true));
+    }
+
+    #[test]
+    fn property_record_float_round_trip() {
+        let rec = PropertyRecord::new_float(1, ENTITY_TYPE_NODE, "score", 3.14);
+        let bytes = rec.to_bytes();
+        let rec2 = PropertyRecord::read_from(&bytes);
+        assert!((rec2.float_value().unwrap() - 3.14).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn property_record_null_round_trip() {
+        let rec = PropertyRecord::new_null(1, ENTITY_TYPE_NODE, "missing");
+        let bytes = rec.to_bytes();
+        let rec2 = PropertyRecord::read_from(&bytes);
+        assert!(rec2.is_null());
     }
 }

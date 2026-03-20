@@ -176,6 +176,11 @@ pub trait StorageAccess {
     fn set_edge_property(&mut self, id: EdgeId, key: &str, value: &Value);
     fn delete_node(&mut self, id: NodeId);
     fn delete_edge(&mut self, id: EdgeId);
+
+    // Transaction lifecycle (default no-ops for backward compatibility)
+    fn begin_tx(&mut self) -> u64 { 0 }
+    fn commit_tx(&mut self) {}
+    fn abort_tx(&mut self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +214,7 @@ impl std::error::Error for ExecutionError {}
 
 /// Execute a plan against storage and return tabular results.
 ///
+/// Every query is implicitly wrapped in an auto-commit transaction.
 /// The execution strategy materializes intermediate results at each step.
 /// The plan structure is push-oriented (each node references its input),
 /// setting up the architecture for streaming execution in a future phase.
@@ -216,7 +222,16 @@ pub fn execute(
     plan: &Plan,
     storage: &mut dyn StorageAccess,
 ) -> Result<QueryResult, ExecutionError> {
-    let rows = execute_plan(plan, storage)?;
+    storage.begin_tx();
+
+    let result = execute_plan(plan, storage);
+
+    match &result {
+        Ok(_) => storage.commit_tx(),
+        Err(_) => storage.abort_tx(),
+    }
+
+    let rows = result?;
 
     let columns = rows
         .first()

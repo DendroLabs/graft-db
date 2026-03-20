@@ -1,5 +1,6 @@
 use std::io::{BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -21,6 +22,10 @@ struct Args {
     /// Number of shard threads (default: number of CPU cores)
     #[arg(long, default_value_t = num_shards_default())]
     shards: usize,
+
+    /// Data directory for persistent storage. If omitted, data is in-memory only.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 fn num_shards_default() -> usize {
@@ -35,15 +40,24 @@ fn main() {
     let args = Args::parse();
     let addr = format!("{}:{}", args.host, args.port);
 
-    let db = Arc::new(Mutex::new(ShardCluster::new(args.shards)));
+    let db = if let Some(ref data_dir) = args.data_dir {
+        let cluster = ShardCluster::open(args.shards, data_dir).unwrap_or_else(|e| {
+            eprintln!("failed to open data directory {}: {e}", data_dir.display());
+            std::process::exit(1);
+        });
+        Arc::new(Mutex::new(cluster))
+    } else {
+        Arc::new(Mutex::new(ShardCluster::new(args.shards)))
+    };
 
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
         eprintln!("failed to bind to {addr}: {e}");
         std::process::exit(1);
     });
 
+    let mode = if args.data_dir.is_some() { "durable" } else { "ephemeral" };
     eprintln!(
-        "graft listening on {addr} ({} shard{})",
+        "graft listening on {addr} ({} shard{}, {mode})",
         args.shards,
         if args.shards == 1 { "" } else { "s" }
     );
