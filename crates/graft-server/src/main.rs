@@ -1,4 +1,4 @@
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -94,6 +94,12 @@ fn handle_connection(stream: TcpStream, db: Arc<Mutex<ShardCluster>>) -> std::io
             client: format!("graft-server {}", env!("CARGO_PKG_VERSION")),
         },
     )?;
+    writer.flush()?;
+
+    // Disable Nagle's algorithm for low-latency responses
+    if let Ok(ref sock) = writer.get_ref().try_clone() {
+        let _ = sock.set_nodelay(true);
+    }
 
     // Query loop
     loop {
@@ -140,9 +146,11 @@ fn handle_connection(stream: TcpStream, db: Arc<Mutex<ShardCluster>>) -> std::io
                                 elapsed_ms: elapsed.as_millis() as u64,
                             },
                         )?;
+                        writer.flush()?;
                     }
                     Err(e) => {
                         send_error(&mut writer, &ErrorMsg { message: e })?;
+                        writer.flush()?;
                     }
                 }
             }
@@ -153,6 +161,7 @@ fn handle_connection(stream: TcpStream, db: Arc<Mutex<ShardCluster>>) -> std::io
                         message: format!("unexpected message type: {:?}", msg_type),
                     },
                 )?;
+                writer.flush()?;
             }
         }
     }
