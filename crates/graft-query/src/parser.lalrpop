@@ -1,0 +1,417 @@
+use crate::ast::*;
+use crate::lexer::{Token, LexError};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = LexError;
+
+    enum Token {
+        "MATCH"  => Token::Match,
+        "CREATE" => Token::Create,
+        "WHERE"  => Token::Where,
+        "RETURN" => Token::Return,
+        "ORDER"  => Token::Order,
+        "BY"     => Token::By,
+        "ASC"    => Token::Asc,
+        "DESC"   => Token::Desc,
+        "LIMIT"  => Token::Limit,
+        "SKIP"   => Token::Skip,
+        "SET"    => Token::Set,
+        "DELETE" => Token::Delete,
+        "AND"    => Token::And,
+        "OR"     => Token::Or,
+        "NOT"    => Token::Not,
+        "NULL"   => Token::Null,
+        "TRUE"   => Token::True,
+        "FALSE"  => Token::False,
+        "AS"     => Token::As,
+        "DISTINCT" => Token::Distinct,
+        "IS"       => Token::Is,
+        "CONTAINS" => Token::Contains,
+        "STARTS"   => Token::Starts,
+        "ENDS"     => Token::Ends,
+        "WITH"     => Token::With,
+        "int"    => Token::Integer(<i64>),
+        "float"  => Token::Float(<f64>),
+        "string" => Token::StringLit(<String>),
+        "ident"  => Token::Ident(<String>),
+        "("      => Token::LParen,
+        ")"      => Token::RParen,
+        "["      => Token::LBracket,
+        "]"      => Token::RBracket,
+        "{"      => Token::LBrace,
+        "}"      => Token::RBrace,
+        ":"      => Token::Colon,
+        ","      => Token::Comma,
+        "."      => Token::Dot,
+        ".."     => Token::DotDot,
+        "-"      => Token::Dash,
+        "->"     => Token::Arrow,
+        "<-"     => Token::LArrow,
+        "="      => Token::Eq,
+        "<>"     => Token::Neq,
+        "<"      => Token::Lt,
+        ">"      => Token::Gt,
+        "<="     => Token::Lte,
+        ">="     => Token::Gte,
+        "+"      => Token::Plus,
+        "*"      => Token::Star,
+        "/"      => Token::Slash,
+        "%"      => Token::Percent,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level
+// ---------------------------------------------------------------------------
+
+pub Statement: Statement = {
+    <clauses:Clause+> => Statement { clauses },
+};
+
+Clause: Clause = {
+    <c:MatchClause> => Clause::Match(c),
+    <c:CreateClause> => Clause::Create(c),
+    <c:WhereClause> => Clause::Where(c),
+    <c:ReturnClause> => Clause::Return(c),
+    <c:OrderByClause> => Clause::OrderBy(c),
+    <c:LimitClause> => Clause::Limit(c),
+    <c:SkipClause> => Clause::Skip(c),
+    <c:SetClause> => Clause::Set(c),
+    <c:DeleteClause> => Clause::Delete(c),
+};
+
+// ---------------------------------------------------------------------------
+// MATCH / CREATE
+// ---------------------------------------------------------------------------
+
+MatchClause: MatchClause = {
+    "MATCH" <patterns:Comma<Pattern>> => MatchClause { patterns },
+};
+
+CreateClause: CreateClause = {
+    "CREATE" <patterns:Comma<Pattern>> => CreateClause { patterns },
+};
+
+// ---------------------------------------------------------------------------
+// Patterns
+// ---------------------------------------------------------------------------
+
+Pattern: Pattern = {
+    <p:PathPattern> => Pattern::Path(p),
+    <n:NodePattern> => Pattern::Node(n),
+};
+
+// A path: node followed by one or more (edge, node) pairs
+PathPattern: Vec<PathElement> = {
+    <n:NodePattern> <rest:EdgeNodePair+> => {
+        let mut elements = vec![PathElement::Node(n)];
+        for (edge, node) in rest {
+            elements.push(PathElement::Edge(edge));
+            elements.push(PathElement::Node(node));
+        }
+        elements
+    },
+};
+
+EdgeNodePair: (EdgePattern, NodePattern) = {
+    <e:RightEdge> <n:NodePattern> => (e, n),
+    <e:LeftEdge> <n:NodePattern> => (e, n),
+    <e:UndirectedEdge> <n:NodePattern> => (e, n),
+};
+
+// -[e:LABEL*1..3 {props}]->
+RightEdge: EdgePattern = {
+    "-" "[" <variable:("ident")?> <label:(":" <"ident">)?> <quantifier:Quantifier?> <properties:Properties?> "]" "->" => {
+        EdgePattern {
+            variable,
+            label,
+            properties: properties.unwrap_or_default(),
+            direction: EdgeDirection::Right,
+            quantifier,
+        }
+    },
+};
+
+// <-[e:LABEL*1..3 {props}]-
+LeftEdge: EdgePattern = {
+    "<-" "[" <variable:("ident")?> <label:(":" <"ident">)?> <quantifier:Quantifier?> <properties:Properties?> "]" "-" => {
+        EdgePattern {
+            variable,
+            label,
+            properties: properties.unwrap_or_default(),
+            direction: EdgeDirection::Left,
+            quantifier,
+        }
+    },
+};
+
+// -[e:LABEL*1..3 {props}]-
+UndirectedEdge: EdgePattern = {
+    "-" "[" <variable:("ident")?> <label:(":" <"ident">)?> <quantifier:Quantifier?> <properties:Properties?> "]" "-" => {
+        EdgePattern {
+            variable,
+            label,
+            properties: properties.unwrap_or_default(),
+            direction: EdgeDirection::Undirected,
+            quantifier,
+        }
+    },
+};
+
+// Variable-length path quantifier: *  *2  *1..3  *..3  *2..
+Quantifier: PathQuantifier = {
+    // *n..m
+    "*" <min:"int"> ".." <max:"int"> => PathQuantifier {
+        min_hops: min as u64,
+        max_hops: Some(max as u64),
+    },
+    // *n..
+    "*" <min:"int"> ".." => PathQuantifier {
+        min_hops: min as u64,
+        max_hops: None,
+    },
+    // *..m
+    "*" ".." <max:"int"> => PathQuantifier {
+        min_hops: 1,
+        max_hops: Some(max as u64),
+    },
+    // *n (exactly n hops)
+    "*" <n:"int"> => PathQuantifier {
+        min_hops: n as u64,
+        max_hops: Some(n as u64),
+    },
+    // * (1 to unbounded)
+    "*" => PathQuantifier {
+        min_hops: 1,
+        max_hops: None,
+    },
+};
+
+NodePattern: NodePattern = {
+    "(" <variable:("ident")?> <label:(":" <"ident">)?> <properties:Properties?> ")" => {
+        NodePattern {
+            variable,
+            label,
+            properties: properties.unwrap_or_default(),
+        }
+    },
+};
+
+Properties: Vec<(String, Expr)> = {
+    "{" <props:Comma<Property>> "}" => props,
+};
+
+Property: (String, Expr) = {
+    <k:"ident"> ":" <v:Expr> => (k, v),
+};
+
+// ---------------------------------------------------------------------------
+// WHERE
+// ---------------------------------------------------------------------------
+
+WhereClause: WhereClause = {
+    "WHERE" <expr:Expr> => WhereClause { expr },
+};
+
+// ---------------------------------------------------------------------------
+// RETURN
+// ---------------------------------------------------------------------------
+
+ReturnClause: ReturnClause = {
+    "RETURN" "DISTINCT" <items:Comma<ReturnItem>> => ReturnClause { distinct: true, items },
+    "RETURN" <items:Comma<ReturnItem>> => ReturnClause { distinct: false, items },
+};
+
+ReturnItem: ReturnItem = {
+    <expr:Expr> <alias:("AS" <"ident">)?> => ReturnItem { expr, alias },
+};
+
+// ---------------------------------------------------------------------------
+// ORDER BY
+// ---------------------------------------------------------------------------
+
+OrderByClause: OrderByClause = {
+    "ORDER" "BY" <items:Comma<OrderByItem>> => OrderByClause { items },
+};
+
+OrderByItem: OrderByItem = {
+    <expr:Expr> <dir:SortDir?> => OrderByItem {
+        expr,
+        direction: dir.unwrap_or(SortDirection::Asc),
+    },
+};
+
+SortDir: SortDirection = {
+    "ASC" => SortDirection::Asc,
+    "DESC" => SortDirection::Desc,
+};
+
+// ---------------------------------------------------------------------------
+// LIMIT / SKIP
+// ---------------------------------------------------------------------------
+
+LimitClause: u64 = {
+    "LIMIT" <n:"int"> => n as u64,
+};
+
+SkipClause: u64 = {
+    "SKIP" <n:"int"> => n as u64,
+};
+
+// ---------------------------------------------------------------------------
+// SET
+// ---------------------------------------------------------------------------
+
+SetClause: SetClause = {
+    "SET" <items:Comma<SetItem>> => SetClause { items },
+};
+
+// SET var.prop = expr
+SetItem: SetItem = {
+    <var:"ident"> "." <prop:"ident"> "=" <value:Expr> => SetItem {
+        target: Expr::Property {
+            expr: Box::new(Expr::Variable(var)),
+            name: prop,
+        },
+        value,
+    },
+};
+
+// ---------------------------------------------------------------------------
+// DELETE
+// ---------------------------------------------------------------------------
+
+DeleteClause: DeleteClause = {
+    "DELETE" <variables:Comma<"ident">> => DeleteClause { variables },
+};
+
+// ---------------------------------------------------------------------------
+// Expressions (precedence climbing)
+// ---------------------------------------------------------------------------
+
+Expr: Expr = {
+    OrExpr,
+};
+
+OrExpr: Expr = {
+    <left:OrExpr> "OR" <right:AndExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Or, right: Box::new(right),
+    },
+    AndExpr,
+};
+
+AndExpr: Expr = {
+    <left:AndExpr> "AND" <right:NotExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::And, right: Box::new(right),
+    },
+    NotExpr,
+};
+
+NotExpr: Expr = {
+    "NOT" <e:NotExpr> => Expr::UnaryOp {
+        op: UnaryOp::Not, expr: Box::new(e),
+    },
+    CompExpr,
+};
+
+CompExpr: Expr = {
+    <left:AddExpr> "=" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Eq, right: Box::new(right),
+    },
+    <left:AddExpr> "<>" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Neq, right: Box::new(right),
+    },
+    <left:AddExpr> "<" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Lt, right: Box::new(right),
+    },
+    <left:AddExpr> ">" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Gt, right: Box::new(right),
+    },
+    <left:AddExpr> "<=" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Lte, right: Box::new(right),
+    },
+    <left:AddExpr> ">=" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Gte, right: Box::new(right),
+    },
+    <e:AddExpr> "IS" "NULL" => Expr::UnaryOp {
+        op: UnaryOp::IsNull, expr: Box::new(e),
+    },
+    <e:AddExpr> "IS" "NOT" "NULL" => Expr::UnaryOp {
+        op: UnaryOp::IsNotNull, expr: Box::new(e),
+    },
+    <left:AddExpr> "CONTAINS" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Contains, right: Box::new(right),
+    },
+    <left:AddExpr> "STARTS" "WITH" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::StartsWith, right: Box::new(right),
+    },
+    <left:AddExpr> "ENDS" "WITH" <right:AddExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::EndsWith, right: Box::new(right),
+    },
+    AddExpr,
+};
+
+AddExpr: Expr = {
+    <left:AddExpr> "+" <right:MulExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Add, right: Box::new(right),
+    },
+    <left:AddExpr> "-" <right:MulExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Sub, right: Box::new(right),
+    },
+    MulExpr,
+};
+
+MulExpr: Expr = {
+    <left:MulExpr> "*" <right:UnaryExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Mul, right: Box::new(right),
+    },
+    <left:MulExpr> "/" <right:UnaryExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Div, right: Box::new(right),
+    },
+    <left:MulExpr> "%" <right:UnaryExpr> => Expr::BinaryOp {
+        left: Box::new(left), op: BinaryOp::Mod, right: Box::new(right),
+    },
+    UnaryExpr,
+};
+
+UnaryExpr: Expr = {
+    "-" <e:UnaryExpr> => Expr::UnaryOp {
+        op: UnaryOp::Neg, expr: Box::new(e),
+    },
+    PostfixExpr,
+};
+
+PostfixExpr: Expr = {
+    <e:PostfixExpr> "." <name:"ident"> => Expr::Property {
+        expr: Box::new(e), name,
+    },
+    PrimaryExpr,
+};
+
+PrimaryExpr: Expr = {
+    "NULL" => Expr::Literal(Literal::Null),
+    "TRUE" => Expr::Literal(Literal::Bool(true)),
+    "FALSE" => Expr::Literal(Literal::Bool(false)),
+    <n:"int"> => Expr::Literal(Literal::Int(n)),
+    <n:"float"> => Expr::Literal(Literal::Float(n)),
+    <s:"string"> => Expr::Literal(Literal::String(s)),
+    <name:"ident"> "(" "*" ")" => Expr::FunctionCall { name, args: vec![Expr::Literal(Literal::Null)] },
+    <name:"ident"> "(" ")" => Expr::FunctionCall { name, args: vec![] },
+    <name:"ident"> "(" <args:Comma<Expr>> ")" => Expr::FunctionCall { name, args },
+    <name:"ident"> => Expr::Variable(name),
+    "(" <Expr> ")",
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+Comma<T>: Vec<T> = {
+    <mut v:(<T> ",")*> <e:T> => {
+        v.push(e);
+        v
+    },
+};

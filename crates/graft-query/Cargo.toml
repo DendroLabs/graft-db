@@ -1,0 +1,13 @@
+[package]
+name = "graft-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Query engine: GQL parser, planner, push-based executor"
+
+[build-dependencies]
+lalrpop = "0.22"
+
+[dependencies]
+graft-core = { workspace = true }
+lalrpop-util = { workspace = true }

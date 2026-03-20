@@ -1,0 +1,11 @@
+[package]
+name = "graft-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Simulation testing: deterministic I/O, fault injection"
+
+[dependencies]
+graft-core = { workspace = true }
+graft-io = { workspace = true }
+graft-runtime = { workspace = true }

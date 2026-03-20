@@ -1,0 +1,17 @@
+[package]
+name = "graft-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shard-per-core runtime: core pinning, message passing, event loop"
+
+[dependencies]
+graft-core = { workspace = true }
+graft-query = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "query"
+harness = false

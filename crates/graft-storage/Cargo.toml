@@ -1,0 +1,20 @@
+[package]
+name = "graft-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Storage engine: pages, node/edge records, buffer pool"
+
+[dependencies]
+graft-core = { workspace = true }
+crc32c = { workspace = true }
+hashbrown = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "page_ops"
+harness = false

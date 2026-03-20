@@ -1,0 +1,13 @@
+[package]
+name = "graft-txn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transactions: MVCC, WAL, snapshot isolation, checkpoints"
+
+[dependencies]
+graft-core = { workspace = true }
+graft-storage = { workspace = true }
+graft-io = { workspace = true }
+crc32c = { workspace = true }
+hashbrown = { workspace = true }

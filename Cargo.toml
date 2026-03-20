@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/graft-core",
+    "crates/graft-storage",
+    "crates/graft-alloc",
+    "crates/graft-io",
+    "crates/graft-txn",
+    "crates/graft-query",
+    "crates/graft-runtime",
+    "crates/graft-server",
+    "crates/graft-client",
+    "crates/graft-cli",
+    "crates/graft-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/DendroLabs/graft-db"
+
+[workspace.dependencies]
+# Internal crates
+graft-core = { path = "crates/graft-core" }
+graft-storage = { path = "crates/graft-storage" }
+graft-alloc = { path = "crates/graft-alloc" }
+graft-io = { path = "crates/graft-io" }
+graft-txn = { path = "crates/graft-txn" }
+graft-query = { path = "crates/graft-query" }
+graft-runtime = { path = "crates/graft-runtime" }
+graft-server = { path = "crates/graft-server" }
+graft-client = { path = "crates/graft-client" }
+graft-cli = { path = "crates/graft-cli" }
+graft-sim = { path = "crates/graft-sim" }
+
+# Serialization
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Hashing / collections
+ahash = "0.8"
+hashbrown = "0.15"
+
+# Concurrency
+crossbeam = "0.8"
+
+# I/O
+io-uring = "0.7"
+
+# CLI
+rustyline = "14"
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+
+# Error handling
+thiserror = "2"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Checksums
+crc32c = "0.6"
+
+# Parsing
+lalrpop-util = "0.22"
+
+# Testing
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"

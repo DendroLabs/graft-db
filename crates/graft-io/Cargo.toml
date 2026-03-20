@@ -1,0 +1,15 @@
+[package]
+name = "graft-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "I/O abstraction: io_uring, posix, simulation backends"
+
+[dependencies]
+graft-core = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "graft-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust client library (async/tokio)"
+
+[dependencies]
+graft-core = { workspace = true }
+rmp-serde = { workspace = true }

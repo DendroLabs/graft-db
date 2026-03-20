@@ -1,0 +1,17 @@
+[package]
+name = "graft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Interactive REPL for graft"
+
+[[bin]]
+name = "graft-cli"
+path = "src/main.rs"
+
+[dependencies]
+graft-core = { workspace = true }
+graft-client = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+rustyline = { workspace = true }
