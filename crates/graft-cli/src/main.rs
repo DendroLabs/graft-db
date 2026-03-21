@@ -24,14 +24,34 @@ fn main() {
         }
     };
 
-    eprintln!("connected to {}", args.address);
+    // Display connection info with role
+    let role_info = match client.server_role() {
+        Some(role) => {
+            let ro = if client.is_read_only() {
+                ", read-only"
+            } else {
+                ""
+            };
+            let shards = client
+                .server_shards()
+                .map(|s| format!(", {} shard{}", s, if s == 1 { "" } else { "s" }))
+                .unwrap_or_default();
+            format!(" ({role}{shards}{ro})")
+        }
+        None => String::new(),
+    };
+    eprintln!("connected to {}{}", args.address, role_info);
     eprintln!("type \\quit to exit, \\help for help\n");
 
     let mut rl = DefaultEditor::new().unwrap();
     let mut buffer = String::new();
 
     loop {
-        let prompt = if buffer.is_empty() { "graft> " } else { "   ... " };
+        let prompt = if buffer.is_empty() {
+            "graft> "
+        } else {
+            "   ... "
+        };
 
         match rl.readline(prompt) {
             Ok(line) => {
@@ -43,6 +63,22 @@ fn main() {
                         "\\quit" | "\\q" | "\\exit" => break,
                         "\\help" | "\\h" | "\\?" => {
                             print_help();
+                            continue;
+                        }
+                        "\\status" => {
+                            execute_query(&mut client, "SHOW REPLICATION STATUS");
+                            continue;
+                        }
+                        "\\replicas" => {
+                            execute_query(&mut client, "SHOW REPLICAS");
+                            continue;
+                        }
+                        "\\lag" => {
+                            execute_query(&mut client, "SHOW REPLICATION LAG");
+                            continue;
+                        }
+                        "\\shards" => {
+                            execute_query(&mut client, "SHOW SHARD STATUS");
                             continue;
                         }
                         "" => continue,
@@ -93,11 +129,7 @@ fn execute_query(client: &mut Client, query: &str) {
                     table.add_row(row);
                 }
                 println!("{table}");
-                println!(
-                    "{} row(s) ({} ms)",
-                    result.rows.len(),
-                    result.elapsed_ms
-                );
+                println!("{} row(s) ({} ms)", result.rows.len(), result.elapsed_ms);
             }
             println!();
         }
@@ -109,8 +141,12 @@ fn execute_query(client: &mut Client, query: &str) {
 
 fn print_help() {
     println!("graft CLI commands:");
-    println!("  \\quit, \\q    Exit the REPL");
-    println!("  \\help, \\h    Show this help");
+    println!("  \\quit, \\q     Exit the REPL");
+    println!("  \\help, \\h     Show this help");
+    println!("  \\status       Show replication status");
+    println!("  \\replicas     Show connected replicas");
+    println!("  \\lag          Show replication lag");
+    println!("  \\shards       Show shard status");
     println!();
     println!("Enter GQL queries terminated with a semicolon (;)");
     println!("Multi-line input is supported — press Enter to continue on the next line.");
@@ -119,5 +155,6 @@ fn print_help() {
     println!("  CREATE (p:Person {{name: 'Alice', age: 30}});");
     println!("  MATCH (p:Person) RETURN p.name, p.age;");
     println!("  MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name;");
+    println!("  SHOW REPLICATION STATUS;");
     println!();
 }

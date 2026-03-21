@@ -11,7 +11,10 @@ graft-query = { workspace = true }
 graft-storage = { workspace = true }
 graft-io = { workspace = true }
 graft-txn = { workspace = true }
+graft-repl = { workspace = true }
 hashbrown = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

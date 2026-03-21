@@ -34,56 +34,115 @@ fn start_test_server_with_shards(shard_count: usize) -> String {
                     &mut writer,
                     &HelloMsg {
                         client: "test-server".into(),
+                        role: Some("standalone".into()),
+                        read_only: Some(false),
+                        shards: None,
                     },
                 )
                 .unwrap();
 
-                // Query loop
+                let mut active_tx: Option<u64> = None;
+
+                // Message loop
                 loop {
                     let (msg_type, payload) = match recv_message(&mut reader) {
                         Ok(m) => m,
                         Err(_) => break,
                     };
-                    if msg_type != MessageType::Query {
-                        break;
-                    }
-                    let query_msg: QueryMsg = rmp_serde::from_slice(&payload).unwrap();
-                    let result = {
-                        let mut db = db.lock().unwrap();
-                        db.query(&query_msg.text)
-                    };
-                    match result {
-                        Ok(qr) => {
-                            send_result(
-                                &mut writer,
-                                &ResultMsg {
-                                    columns: qr.columns,
-                                },
-                            )
-                            .unwrap();
-                            let row_count = qr.rows.len() as u64;
-                            for row in &qr.rows {
-                                send_row(
-                                    &mut writer,
-                                    &RowMsg {
-                                        values: row.iter().map(|v| format!("{v}")).collect(),
-                                    },
-                                )
+                    match msg_type {
+                        MessageType::BeginTx => {
+                            let tx_id = {
+                                let mut db = db.lock().unwrap();
+                                db.begin_explicit_tx()
+                            };
+                            active_tx = Some(tx_id);
+                            send_begin_tx_response(&mut writer, &BeginTxResponseMsg { tx_id })
                                 .unwrap();
+                        }
+                        MessageType::CommitTx => {
+                            {
+                                let mut db = db.lock().unwrap();
+                                db.commit_explicit_tx();
                             }
+                            active_tx = None;
                             send_summary(
                                 &mut writer,
                                 &SummaryMsg {
-                                    rows_affected: row_count,
+                                    rows_affected: 0,
                                     elapsed_ms: 0,
                                 },
                             )
                             .unwrap();
                         }
-                        Err(e) => {
-                            send_error(&mut writer, &ErrorMsg { message: e }).unwrap();
+                        MessageType::RollbackTx => {
+                            {
+                                let mut db = db.lock().unwrap();
+                                db.abort_explicit_tx();
+                            }
+                            active_tx = None;
+                            send_summary(
+                                &mut writer,
+                                &SummaryMsg {
+                                    rows_affected: 0,
+                                    elapsed_ms: 0,
+                                },
+                            )
+                            .unwrap();
                         }
+                        MessageType::Query => {
+                            let query_msg: QueryMsg = rmp_serde::from_slice(&payload).unwrap();
+                            let result = {
+                                let mut db = db.lock().unwrap();
+                                if active_tx.is_some() {
+                                    db.query_in_tx(&query_msg.text)
+                                } else {
+                                    db.query(&query_msg.text)
+                                }
+                            };
+                            match result {
+                                Ok(qr) => {
+                                    send_result(
+                                        &mut writer,
+                                        &ResultMsg {
+                                            columns: qr.columns,
+                                        },
+                                    )
+                                    .unwrap();
+                                    let row_count = qr.rows.len() as u64;
+                                    for row in &qr.rows {
+                                        send_row(
+                                            &mut writer,
+                                            &RowMsg {
+                                                values: row
+                                                    .iter()
+                                                    .map(|v| format!("{v}"))
+                                                    .collect(),
+                                            },
+                                        )
+                                        .unwrap();
+                                    }
+                                    send_summary(
+                                        &mut writer,
+                                        &SummaryMsg {
+                                            rows_affected: row_count,
+                                            elapsed_ms: 0,
+                                        },
+                                    )
+                                    .unwrap();
+                                }
+                                Err(e) => {
+                                    send_error(&mut writer, &ErrorMsg { message: e }).unwrap();
+                                }
+                            }
+                        }
+                        _ => break,
                     }
+                }
+
+                // Abort orphaned tx on disconnect
+                if active_tx.is_some() {
+                    let mut db = db.lock().unwrap();
+                    db.abort_explicit_tx();
                 }
             });
         }
@@ -120,9 +179,7 @@ fn create_edge_and_traverse() {
     let addr = start_test_server();
     let mut client = graft_client::Client::connect(&addr).unwrap();
 
-    client
-        .query("CREATE (:Person {name: 'Alice'})")
-        .unwrap();
+    client.query("CREATE (:Person {name: 'Alice'})").unwrap();
     client.query("CREATE (:Person {name: 'Bob'})").unwrap();
     client
         .query(
@@ -169,9 +226,7 @@ fn multiple_queries_same_connection() {
     let mut client = graft_client::Client::connect(&addr).unwrap();
 
     for i in 0..10 {
-        client
-            .query(&format!("CREATE (:N {{v: {i}}})",))
-            .unwrap();
+        client.query(&format!("CREATE (:N {{v: {i}}})",)).unwrap();
     }
 
     let result = client.query("MATCH (n:N) RETURN COUNT(n)").unwrap();
@@ -184,17 +239,13 @@ fn multi_shard_over_wire() {
     let mut client = graft_client::Client::connect(&addr).unwrap();
 
     for i in 0..8 {
-        client
-            .query(&format!("CREATE (:N {{v: {i}}})"))
-            .unwrap();
+        client.query(&format!("CREATE (:N {{v: {i}}})")).unwrap();
     }
 
     let result = client.query("MATCH (n:N) RETURN COUNT(*)").unwrap();
     assert_eq!(result.rows[0][0], "8");
 
-    let result = client
-        .query("MATCH (n:N) RETURN n.v ORDER BY n.v")
-        .unwrap();
+    let result = client.query("MATCH (n:N) RETURN n.v ORDER BY n.v").unwrap();
     assert_eq!(result.rows.len(), 8);
     assert_eq!(result.rows[0][0], "0");
     assert_eq!(result.rows[7][0], "7");
@@ -220,4 +271,146 @@ fn multi_shard_traversal_over_wire() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], "Alice");
     assert_eq!(result.rows[0][1], "Bob");
+}
+
+#[test]
+fn explicit_tx_commit_over_wire() {
+    let addr = start_test_server();
+    let mut client = graft_client::Client::connect(&addr).unwrap();
+
+    let tx_id = client.begin_tx().unwrap();
+    assert!(tx_id > 0);
+
+    client.query("CREATE (:Person {name: 'Alice'})").unwrap();
+    let result = client.query("MATCH (p:Person) RETURN p.name").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], "Alice");
+
+    client.commit_tx().unwrap();
+
+    let result = client.query("MATCH (p:Person) RETURN p.name").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], "Alice");
+}
+
+#[test]
+fn explicit_tx_rollback_over_wire() {
+    let addr = start_test_server();
+    let mut client = graft_client::Client::connect(&addr).unwrap();
+
+    client.begin_tx().unwrap();
+    client.query("CREATE (:Person {name: 'Alice'})").unwrap();
+    client.rollback_tx().unwrap();
+
+    let result = client.query("MATCH (p:Person) RETURN p.name").unwrap();
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn connection_drop_aborts_orphaned_tx() {
+    let addr = start_test_server();
+
+    // Start a tx and create a node, then drop the connection without committing
+    {
+        let mut client = graft_client::Client::connect(&addr).unwrap();
+        client.begin_tx().unwrap();
+        client.query("CREATE (:Ghost {name: 'phantom'})").unwrap();
+        // client drops here — server should abort the tx
+    }
+
+    // Give the server a moment to process the disconnect
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // New connection should not see the uncommitted data
+    let mut client2 = graft_client::Client::connect(&addr).unwrap();
+    let result = client2.query("MATCH (g:Ghost) RETURN g.name").unwrap();
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn explicit_tx_multi_statement_over_wire() {
+    let addr = start_test_server();
+    let mut client = graft_client::Client::connect(&addr).unwrap();
+
+    client.begin_tx().unwrap();
+
+    // Multiple creates within the tx
+    client.query("CREATE (:N {name: 'a', v: 1})").unwrap();
+    client.query("CREATE (:N {name: 'b', v: 2})").unwrap();
+    client.query("CREATE (:N {name: 'c', v: 3})").unwrap();
+
+    // Read within tx
+    let result = client.query("MATCH (n:N) RETURN COUNT(*)").unwrap();
+    assert_eq!(result.rows[0][0], "3");
+
+    // Modify within tx
+    client.query("MATCH (n:N {name: 'b'}) SET n.v = 99").unwrap();
+    client.query("MATCH (n:N {name: 'c'}) DELETE n").unwrap();
+
+    let result = client
+        .query("MATCH (n:N) RETURN n.name, n.v ORDER BY n.name")
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], "a");
+    assert_eq!(result.rows[1][0], "b");
+    assert_eq!(result.rows[1][1], "99");
+
+    client.commit_tx().unwrap();
+
+    // Verify post-commit
+    let result = client.query("MATCH (n:N) RETURN COUNT(*)").unwrap();
+    assert_eq!(result.rows[0][0], "2");
+}
+
+#[test]
+fn auto_commit_queries_between_explicit_txs() {
+    let addr = start_test_server();
+    let mut client = graft_client::Client::connect(&addr).unwrap();
+
+    // Auto-commit
+    client.query("CREATE (:N {v: 1})").unwrap();
+
+    // Explicit tx
+    client.begin_tx().unwrap();
+    client.query("CREATE (:N {v: 2})").unwrap();
+    client.commit_tx().unwrap();
+
+    // Auto-commit again
+    client.query("CREATE (:N {v: 3})").unwrap();
+
+    // Another explicit tx
+    client.begin_tx().unwrap();
+    client.query("CREATE (:N {v: 4})").unwrap();
+    client.rollback_tx().unwrap();
+
+    // Should see 3 nodes (v=1, v=2, v=3; v=4 was rolled back)
+    let result = client
+        .query("MATCH (n:N) RETURN n.v ORDER BY n.v")
+        .unwrap();
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0][0], "1");
+    assert_eq!(result.rows[1][0], "2");
+    assert_eq!(result.rows[2][0], "3");
+}
+
+#[test]
+fn multi_shard_explicit_tx_over_wire() {
+    let addr = start_test_server_with_shards(4);
+    let mut client = graft_client::Client::connect(&addr).unwrap();
+
+    client.begin_tx().unwrap();
+    for i in 0..8 {
+        client.query(&format!("CREATE (:N {{v: {i}}})")).unwrap();
+    }
+
+    // All 8 should be visible within the tx across 4 shards
+    let result = client.query("MATCH (n:N) RETURN COUNT(*)").unwrap();
+    assert_eq!(result.rows[0][0], "8");
+
+    client.commit_tx().unwrap();
+
+    let result = client
+        .query("MATCH (n:N) RETURN n.v ORDER BY n.v")
+        .unwrap();
+    assert_eq!(result.rows.len(), 8);
 }

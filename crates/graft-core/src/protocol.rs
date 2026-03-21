@@ -27,6 +27,11 @@ pub enum MessageType {
     BeginTx = 7,
     CommitTx = 8,
     RollbackTx = 9,
+    // Replication message types (10-13) — used on the replication port
+    ReplHello = 10,
+    WalBatch = 11,
+    WalAck = 12,
+    ReplStatus = 13,
 }
 
 impl MessageType {
@@ -41,6 +46,10 @@ impl MessageType {
             7 => Some(Self::BeginTx),
             8 => Some(Self::CommitTx),
             9 => Some(Self::RollbackTx),
+            10 => Some(Self::ReplHello),
+            11 => Some(Self::WalBatch),
+            12 => Some(Self::WalAck),
+            13 => Some(Self::ReplStatus),
             _ => None,
         }
     }
@@ -53,6 +62,15 @@ impl MessageType {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HelloMsg {
     pub client: String,
+    /// Server role: "standalone", "primary", or "replica". Absent in older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Whether the server is read-only (replicas). Absent in older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    /// Number of shards. Absent in older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +97,11 @@ pub struct SummaryMsg {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ErrorMsg {
     pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BeginTxResponseMsg {
+    pub tx_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,39 +177,57 @@ pub fn recv_message<R: Read>(reader: &mut R) -> io::Result<(MessageType, Vec<u8>
 // ---------------------------------------------------------------------------
 
 pub fn send_hello<W: Write>(w: &mut W, msg: &HelloMsg) -> io::Result<()> {
-    let payload = rmp_serde::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_message(w, MessageType::Hello, &payload)
 }
 
 pub fn send_query<W: Write>(w: &mut W, msg: &QueryMsg) -> io::Result<()> {
-    let payload = rmp_serde::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_message(w, MessageType::Query, &payload)
 }
 
 pub fn send_result<W: Write>(w: &mut W, msg: &ResultMsg) -> io::Result<()> {
-    let payload = rmp_serde::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_message(w, MessageType::Result, &payload)
 }
 
 pub fn send_row<W: Write>(w: &mut W, msg: &RowMsg) -> io::Result<()> {
-    let payload = rmp_serde::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_message(w, MessageType::Row, &payload)
 }
 
 pub fn send_summary<W: Write>(w: &mut W, msg: &SummaryMsg) -> io::Result<()> {
-    let payload = rmp_serde::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_message(w, MessageType::Summary, &payload)
 }
 
 pub fn send_error<W: Write>(w: &mut W, msg: &ErrorMsg) -> io::Result<()> {
-    let payload = rmp_serde::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     send_message(w, MessageType::Error, &payload)
+}
+
+pub fn send_begin_tx<W: Write>(w: &mut W) -> io::Result<()> {
+    send_message(w, MessageType::BeginTx, &[])
+}
+
+pub fn send_commit_tx<W: Write>(w: &mut W) -> io::Result<()> {
+    send_message(w, MessageType::CommitTx, &[])
+}
+
+pub fn send_rollback_tx<W: Write>(w: &mut W) -> io::Result<()> {
+    send_message(w, MessageType::RollbackTx, &[])
+}
+
+pub fn send_begin_tx_response<W: Write>(w: &mut W, msg: &BeginTxResponseMsg) -> io::Result<()> {
+    let payload =
+        rmp_serde::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    send_message(w, MessageType::BeginTx, &payload)
 }
 
 #[cfg(test)]
@@ -223,7 +264,16 @@ mod tests {
     #[test]
     fn typed_hello_round_trip() {
         let mut buf = Vec::new();
-        send_hello(&mut buf, &HelloMsg { client: "test".into() }).unwrap();
+        send_hello(
+            &mut buf,
+            &HelloMsg {
+                client: "test".into(),
+                role: None,
+                read_only: None,
+                shards: None,
+            },
+        )
+        .unwrap();
 
         let mut reader = &buf[..];
         let (msg_type, payload) = recv_message(&mut reader).unwrap();
@@ -237,7 +287,11 @@ mod tests {
         for i in 1..=9u8 {
             assert!(MessageType::from_u8(i).is_some());
         }
+        // Replication types (10-13)
+        for i in 10..=13u8 {
+            assert!(MessageType::from_u8(i).is_some());
+        }
         assert!(MessageType::from_u8(0).is_none());
-        assert!(MessageType::from_u8(10).is_none());
+        assert!(MessageType::from_u8(14).is_none());
     }
 }

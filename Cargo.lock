@@ -543,6 +543,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "graft-repl"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "graft-core",
+ "graft-io",
+ "graft-runtime",
+ "graft-storage",
+ "graft-txn",
+ "rmp-serde",
+ "serde",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "graft-runtime"
 version = "0.1.0"
 dependencies = [
@@ -550,10 +566,13 @@ dependencies = [
  "graft-core",
  "graft-io",
  "graft-query",
+ "graft-repl",
  "graft-storage",
  "graft-txn",
  "hashbrown 0.15.5",
+ "libc",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -564,6 +583,7 @@ dependencies = [
  "graft-client",
  "graft-core",
  "graft-query",
+ "graft-repl",
  "graft-runtime",
  "rmp-serde",
  "tracing",

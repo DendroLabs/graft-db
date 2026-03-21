@@ -1,0 +1,20 @@
+[package]
+name = "graft-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replication: WAL shipping protocol, sender, receiver, commit buffer"
+
+[dependencies]
+graft-core = { workspace = true }
+graft-txn = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+crc32c = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+graft-io = { workspace = true }
+graft-storage = { workspace = true }
+graft-runtime = { workspace = true }
+tempfile = { workspace = true }

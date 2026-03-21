@@ -68,9 +68,21 @@ fn main() {
 
         println!("  {name}");
         println!("    iterations: {iterations}");
-        println!("    avg: {:>10.1} µs    p50: {:>10.1} µs", avg.as_nanos() as f64 / 1000.0, p50.as_nanos() as f64 / 1000.0);
-        println!("    p95: {:>10.1} µs    p99: {:>10.1} µs", p95.as_nanos() as f64 / 1000.0, p99.as_nanos() as f64 / 1000.0);
-        println!("    min: {:>10.1} µs    max: {:>10.1} µs", min.as_nanos() as f64 / 1000.0, max.as_nanos() as f64 / 1000.0);
+        println!(
+            "    avg: {:>10.1} µs    p50: {:>10.1} µs",
+            avg.as_nanos() as f64 / 1000.0,
+            p50.as_nanos() as f64 / 1000.0
+        );
+        println!(
+            "    p95: {:>10.1} µs    p99: {:>10.1} µs",
+            p95.as_nanos() as f64 / 1000.0,
+            p99.as_nanos() as f64 / 1000.0
+        );
+        println!(
+            "    min: {:>10.1} µs    max: {:>10.1} µs",
+            min.as_nanos() as f64 / 1000.0,
+            max.as_nanos() as f64 / 1000.0
+        );
         println!("    throughput: {qps:.0} queries/sec");
         println!();
     };

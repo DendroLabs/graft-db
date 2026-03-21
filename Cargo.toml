@@ -12,6 +12,7 @@ members = [
     "crates/graft-client",
     "crates/graft-cli",
     "crates/graft-sim",
+    "crates/graft-repl",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ graft-server = { path = "crates/graft-server" }
 graft-client = { path = "crates/graft-client" }
 graft-cli = { path = "crates/graft-cli" }
 graft-sim = { path = "crates/graft-sim" }
+graft-repl = { path = "crates/graft-repl" }
 
 # Serialization
 rmp-serde = "1"
@@ -47,6 +49,7 @@ crossbeam = "0.8"
 
 # I/O
 io-uring = "0.7"
+libc = "0.2"
 
 # CLI
 rustyline = "14"
