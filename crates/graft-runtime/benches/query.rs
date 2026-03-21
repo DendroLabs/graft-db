@@ -426,6 +426,86 @@ fn bench_memory_overhead(c: &mut Criterion) {
 }
 
 // ===========================================================================
+// 8. MVCC TRANSACTION OVERHEAD
+// ===========================================================================
+
+fn bench_tx_begin_commit(c: &mut Criterion) {
+    use graft_query::Value;
+
+    let mut group = c.benchmark_group("mvcc_tx");
+
+    // Measure begin + commit cycle (no writes) on ephemeral shard
+    group.bench_function("begin_commit_empty", |b| {
+        let mut shard = Shard::new(0);
+        b.iter(|| {
+            let tx = shard.begin_tx();
+            shard.commit_tx();
+            black_box(tx);
+        });
+    });
+
+    // Measure begin + single write + commit
+    group.bench_function("begin_write_commit", |b| {
+        let mut shard = Shard::new(0);
+        b.iter(|| {
+            shard.begin_tx();
+            shard.create_node(Some("N"), &[("v".into(), Value::Int(1))]);
+            shard.commit_tx();
+        });
+    });
+
+    // Measure visibility check overhead: scan with active tx
+    group.bench_function("scan_under_tx_1000", |b| {
+        let mut shard = Shard::new(0);
+        for i in 0..1_000 {
+            shard.begin_tx();
+            shard.create_node(Some("N"), &[("v".into(), Value::Int(i))]);
+            shard.commit_tx();
+        }
+        b.iter(|| {
+            shard.begin_tx();
+            let nodes = shard.scan_nodes(Some("N"));
+            shard.commit_tx();
+            black_box(nodes);
+        });
+    });
+
+    // Measure traversal with MVCC active
+    group.bench_function("traverse_under_tx", |b| {
+        let mut shard = Shard::new(0);
+        let mut ids = Vec::with_capacity(100);
+        for i in 0..100 {
+            shard.begin_tx();
+            let id = shard.create_node(Some("P"), &[("v".into(), Value::Int(i))]);
+            ids.push(id);
+            shard.commit_tx();
+        }
+        for i in 0..99 {
+            shard.begin_tx();
+            shard.create_edge(ids[i], ids[i + 1], Some("E"), &[]);
+            shard.commit_tx();
+        }
+        let first = ids[0];
+        b.iter(|| {
+            shard.begin_tx();
+            let mut current = first;
+            for _ in 0..10 {
+                let edges = shard.outbound_edges(current, Some("E"));
+                if let Some(e) = edges.first() {
+                    current = e.target;
+                } else {
+                    break;
+                }
+            }
+            shard.commit_tx();
+            black_box(current);
+        });
+    });
+
+    group.finish();
+}
+
+// ===========================================================================
 // Group registration
 // ===========================================================================
 
@@ -440,5 +520,6 @@ criterion_group!(
     bench_e2e_queries,
     bench_multi_shard,
     bench_memory_overhead,
+    bench_tx_begin_commit,
 );
 criterion_main!(benches);

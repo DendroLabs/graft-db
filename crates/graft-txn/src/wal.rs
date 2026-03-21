@@ -223,8 +223,13 @@ impl WalWriter {
         lsn
     }
 
-    /// Flush the buffer to disk and sync.
-    pub fn flush(&mut self, io: &mut dyn IoBackend) -> io::Result<()> {
+    /// Write the buffer to the OS page cache (no fsync).
+    ///
+    /// Data is durable against process crashes (the OS has it) but NOT
+    /// against power failure until `sync()` is called. This is the
+    /// group-commit fast path: multiple transactions can `write()`,
+    /// then a single `sync()` makes them all durable at once.
+    pub fn write(&mut self, io: &mut dyn IoBackend) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -232,8 +237,25 @@ impl WalWriter {
         debug_assert_eq!(written, self.buffer.len());
         self.file_offset += self.buffer.len() as u64;
         self.buffer.clear();
+        Ok(())
+    }
+
+    /// Fsync the WAL file, making all previously written data durable
+    /// against power failure.
+    pub fn sync(&mut self, io: &mut dyn IoBackend) -> io::Result<()> {
         io.sync(self.handle)?;
         self.flushed_offset = self.file_offset;
+        Ok(())
+    }
+
+    /// Write the buffer to disk AND fsync (equivalent to `write()` + `sync()`).
+    ///
+    /// Use this when you need immediate durability (e.g., full checkpoint).
+    /// For normal transaction commits, prefer `write()` with periodic `sync()`
+    /// for group-commit throughput.
+    pub fn flush(&mut self, io: &mut dyn IoBackend) -> io::Result<()> {
+        self.write(io)?;
+        self.sync(io)?;
         Ok(())
     }
 

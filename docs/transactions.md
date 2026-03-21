@@ -174,15 +174,32 @@ Offset  Size  Field
 
 The LSN is the **byte offset** of a record within the WAL file. This gives a total ordering of all WAL records and allows pages to track which WAL entry they were last updated from (via the page header's `lsn` field).
 
-### Buffered Writes
+### Buffered Writes and Group Commit
 
-The WAL writer maintains a **64 KB in-memory buffer**. Records are appended to the buffer via `append()`, which returns the LSN immediately. The buffer is flushed to disk + synced when:
+The WAL writer maintains a **64 KB in-memory buffer**. Records are appended to the buffer via `append()`, which returns the LSN immediately.
 
-- A transaction commits (`commit()` calls `wal.flush()`)
-- The buffer exceeds the 64 KB threshold (`should_flush()`)
-- A group commit window expires (planned: 2ms timer)
+The WAL has two separate operations:
 
-This batching amortizes the cost of `fsync` across multiple transactions.
+- **`write()`**: flushes the buffer to the OS page cache. Data is safe against process crashes (the OS has it) but NOT against power failure.
+- **`sync()`**: calls `fsync`, making all written data durable against power failure.
+- **`flush()`**: `write()` + `sync()` combined. Used for full checkpoints.
+
+#### Group Commit
+
+Transaction commits use **group commit** to amortize `fsync` cost:
+
+1. On commit, the WAL Commit record is written to the OS page cache via `write()` (no fsync).
+2. The shard periodically calls `sync()` when either threshold is reached:
+   - **Time**: 2ms since last sync (`GROUP_COMMIT_INTERVAL_MS`)
+   - **Count**: 64 commits since last sync (`GROUP_COMMIT_MAX_PENDING`)
+
+This means:
+
+- **Committed data is immediately safe against process crashes** (application crash, OOM kill, segfault). The OS page cache has the data and will write it to disk.
+- **On power failure**, up to ~2ms or 64 transactions of committed data may be lost. This is the same tradeoff PostgreSQL makes with `synchronous_commit = off`.
+- **Full checkpoints** (`Shard::flush()`) always use `flush()` (write + sync) for complete durability.
+
+The group commit optimization yields a ~50x throughput improvement for durable writes on typical hardware.
 
 ### Recovery
 

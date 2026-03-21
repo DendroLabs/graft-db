@@ -134,10 +134,15 @@ impl TransactionManager {
             }
         }
 
-        // No conflicts — commit
+        // No conflicts — commit.
+        // Write the commit record to the OS page cache (no fsync).
+        // Group commit: the shard will periodically fsync, bounding the
+        // durability window to a few milliseconds. Data is safe against
+        // process crashes immediately (OS has it), but not against power
+        // failure until the next sync.
         if let (Some(wal), Some(io)) = (wal, io) {
             wal.append(tx_id, WalRecordType::Commit, &WalBody::Empty);
-            wal.flush(io).map_err(Error::Io)?;
+            wal.write(io).map_err(Error::Io)?;
         }
 
         // Update bookkeeping

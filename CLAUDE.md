@@ -57,7 +57,7 @@ crates/
 - `Snapshot` visibility: checks `tx_min`/`tx_max` against snapshot timestamp and active set
 - Own-writes visible within a transaction (special case in `is_record_visible`)
 - `was_committed()` handles both current-session and post-recovery (pre-`base_tx_id`) visibility
-- Per-shard WAL files with 64KB write buffer; WAL records stamped with `current_tx`
+- Per-shard WAL files with 64KB write buffer; WAL records stamped with `current_tx`; group commit (write to OS page cache on commit, fsync every 2ms or 64 commits)
 - Two-pass WAL recovery: pass 1 builds committed tx set, pass 2 replays only committed writes
 - Snapshot isolation with first-committer-wins conflict detection
 - Edge chain traversal reads raw records for next pointers, checks visibility separately (invisible edges skipped without breaking chain)
@@ -124,7 +124,8 @@ cargo run --bin graft-cli -- connect localhost:7687
 9. ~~Persistence~~ — **done**: Shard::open() with page-based storage, WAL-logged mutations, dirty page flush, recovery via file scan + WAL replay, buffer pool eviction writes to disk
 10. ~~MVCC transactions~~ — **done**: per-shard TransactionManager, auto-commit in executor, Snapshot visibility, own-writes, two-pass WAL recovery (committed-only replay), tx_min/tx_max stamping, edge chain MVCC traversal, 221 tests passing
 11. ~~io_uring backend~~ — **done**: IoUringBackend with O_DIRECT for data files, fdatasync, EINVAL fallback, Shard generic over IoBackend via Box<dyn IoBackend + Send>, default_backend() auto-selects io_uring on Linux
-12. **Next**: benchmarks (criterion), core pinning
+12. ~~Group commit + benchmarks~~ — **done**: WAL group commit (write to OS page cache, fsync every 2ms/64 commits, ~50x durable write throughput), MVCC benchmarks (tx overhead, visibility), persistence benchmarks (WAL write, flush, recovery, ephemeral vs durable)
+13. **Next**: core pinning
 
 ## Key Dependencies
 

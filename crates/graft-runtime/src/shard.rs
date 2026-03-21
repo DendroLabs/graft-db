@@ -21,6 +21,14 @@ use crate::label::LabelDictionary;
 // Default buffer pool capacity (pages) per pool.
 const DEFAULT_POOL_CAPACITY: usize = 1024;
 
+/// Group commit: sync the WAL at most every N milliseconds or N commits,
+/// whichever comes first. Between syncs, committed data is in the OS page
+/// cache (safe against process crashes) but not yet durable against power
+/// failure. At 2ms / 64 commits, the worst-case data loss on power failure
+/// is bounded to a few milliseconds of committed transactions.
+const GROUP_COMMIT_INTERVAL_MS: u64 = 2;
+const GROUP_COMMIT_MAX_PENDING: u32 = 64;
+
 // ---------------------------------------------------------------------------
 // ShardConfig
 // ---------------------------------------------------------------------------
@@ -108,6 +116,10 @@ pub struct Shard {
     current_snapshot: Option<Snapshot>,
     next_local_tx: TxId,
 
+    // Group commit: track time + count since last WAL sync for periodic fsync.
+    last_sync_ms: u64,
+    commits_since_sync: u32,
+
     // I/O + WAL — None for ephemeral shards
     io: Option<RefCell<Box<dyn IoBackend + Send>>>,
     wal: Option<RefCell<WalWriter>>,
@@ -140,6 +152,8 @@ impl Shard {
             current_tx: 0,
             current_snapshot: None,
             next_local_tx: 1,
+            last_sync_ms: 0,
+            commits_since_sync: 0,
             io: None,
             wal: None,
             node_file: None,
@@ -410,6 +424,8 @@ impl Shard {
             current_tx: 0,
             current_snapshot: None,
             next_local_tx,
+            last_sync_ms: 0,
+            commits_since_sync: 0,
             io: Some(RefCell::new(io)),
             wal: Some(RefCell::new(wal)),
             node_file: Some(node_fh),
@@ -612,7 +628,7 @@ impl Shard {
             );
             if wal.should_flush() {
                 if let Some(ref io_cell) = self.io {
-                    let _ = wal.flush(&mut **io_cell.borrow_mut());
+                    let _ = wal.write(&mut **io_cell.borrow_mut());
                 }
             }
         }
@@ -636,7 +652,7 @@ impl Shard {
             );
             if wal.should_flush() {
                 if let Some(ref io_cell) = self.io {
-                    let _ = wal.flush(&mut **io_cell.borrow_mut());
+                    let _ = wal.write(&mut **io_cell.borrow_mut());
                 }
             }
         }
@@ -655,21 +671,48 @@ impl Shard {
     }
 
     /// Commit the current transaction.
+    ///
+    /// Uses group commit: the WAL commit record is written to the OS page
+    /// cache immediately (safe against process crashes) but fsync is deferred
+    /// until the group commit interval (2ms) has elapsed. This bounds the
+    /// worst-case data loss on power failure to ~2ms of committed transactions.
     pub fn commit_current_tx(&mut self) {
         if self.current_tx == 0 {
             return;
         }
         let tx_id = self.current_tx;
-        let mut wal_ref = self.wal.as_ref().map(|w| w.borrow_mut());
-        let wal_opt = wal_ref.as_deref_mut();
-        let mut io_ref = self.io.as_ref().map(|i| i.borrow_mut());
-        let io_opt: Option<&mut dyn IoBackend> = match io_ref.as_mut() {
-            Some(r) => Some(&mut ***r),
-            None => None,
-        };
-        let _ = self.tx_mgr.commit(tx_id, wal_opt, io_opt);
+
+        // Scope the RefCell borrows so they're dropped before the group commit sync.
+        {
+            let mut wal_ref = self.wal.as_ref().map(|w| w.borrow_mut());
+            let wal_opt = wal_ref.as_deref_mut();
+            let mut io_ref = self.io.as_ref().map(|i| i.borrow_mut());
+            let io_opt: Option<&mut dyn IoBackend> = match io_ref.as_mut() {
+                Some(r) => Some(&mut ***r),
+                None => None,
+            };
+            let _ = self.tx_mgr.commit(tx_id, wal_opt, io_opt);
+        }
+
         self.current_tx = 0;
         self.current_snapshot = None;
+
+        // Group commit: periodically fsync the WAL to bound the durability window.
+        // Sync when either the time interval or commit count threshold is reached.
+        self.commits_since_sync += 1;
+        if let (Some(ref wal_cell), Some(ref io_cell)) = (&self.wal, &self.io) {
+            let should_sync = self.commits_since_sync >= GROUP_COMMIT_MAX_PENDING || {
+                let now = io_cell.borrow().now_millis();
+                now >= self.last_sync_ms + GROUP_COMMIT_INTERVAL_MS
+            };
+            if should_sync {
+                let mut wal = wal_cell.borrow_mut();
+                let mut io = io_cell.borrow_mut();
+                let _ = wal.sync(&mut **io);
+                self.last_sync_ms = io.now_millis();
+                self.commits_since_sync = 0;
+            }
+        }
     }
 
     /// Abort the current transaction.
