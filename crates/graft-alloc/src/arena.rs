@@ -84,8 +84,7 @@ impl Arena {
         chunks.truncate(1);
         let chunk = &mut chunks[0];
         self.ptr.set(chunk.as_mut_ptr());
-        self.end
-            .set(unsafe { chunk.as_mut_ptr().add(chunk.len()) });
+        self.end.set(unsafe { chunk.as_mut_ptr().add(chunk.len()) });
         self.bytes_used.set(0);
     }
 

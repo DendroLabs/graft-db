@@ -94,10 +94,7 @@ fn bench_insert_node(c: &mut Criterion) {
                 || Shard::new(0),
                 |mut shard| {
                     for i in 0..n {
-                        shard.create_node(
-                            Some("N"),
-                            &[("v".into(), Value::Int(i as i64))],
-                        );
+                        shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
                     }
                     black_box(&shard);
                 },
@@ -118,7 +115,9 @@ fn bench_insert_edge(c: &mut Criterion) {
                 || {
                     let mut shard = Shard::new(0);
                     let ids: Vec<_> = (0..n + 1)
-                        .map(|i| shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]))
+                        .map(|i| {
+                            shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))])
+                        })
                         .collect();
                     (shard, ids)
                 },
@@ -222,33 +221,32 @@ fn bench_multi_hop_traversal(c: &mut Criterion) {
     let mut group = c.benchmark_group("traversal_multi_hop");
 
     let shard = shard_with_chain(1_000);
-    let first_node = shard.scan_nodes(Some("Person")).into_iter()
+    let first_node = shard
+        .scan_nodes(Some("Person"))
+        .into_iter()
         .find(|n| {
             let rec_name = shard.node_property(n.id, "name");
             rec_name == graft_query::Value::String("person_0".into())
         })
-        .unwrap().id;
+        .unwrap()
+        .id;
 
     // Measure k-hop traversal by walking the chain
     for &hops in &[1, 2, 5, 10] {
-        group.bench_with_input(
-            BenchmarkId::new("chain_walk", hops),
-            &hops,
-            |b, &hops| {
-                b.iter(|| {
-                    let mut current = first_node;
-                    for _ in 0..hops {
-                        let edges = shard.outbound_edges(current, Some("KNOWS"));
-                        if let Some(e) = edges.first() {
-                            current = e.target;
-                        } else {
-                            break;
-                        }
+        group.bench_with_input(BenchmarkId::new("chain_walk", hops), &hops, |b, &hops| {
+            b.iter(|| {
+                let mut current = first_node;
+                for _ in 0..hops {
+                    let edges = shard.outbound_edges(current, Some("KNOWS"));
+                    if let Some(e) = edges.first() {
+                        current = e.target;
+                    } else {
+                        break;
                     }
-                    black_box(current);
-                });
-            },
-        );
+                }
+                black_box(current);
+            });
+        });
     }
     group.finish();
 }
@@ -280,10 +278,8 @@ fn bench_e2e_queries(c: &mut Criterion) {
     group.bench_function("single_hop", |b| {
         b.iter(|| {
             black_box(
-                db.query(
-                    "MATCH (a:Person {name: 'person_0'})-[:KNOWS]->(b:Person) RETURN b.name",
-                )
-                .unwrap(),
+                db.query("MATCH (a:Person {name: 'person_0'})-[:KNOWS]->(b:Person) RETURN b.name")
+                    .unwrap(),
             );
         });
     });
@@ -372,31 +368,17 @@ fn bench_multi_shard(c: &mut Criterion) {
                 .unwrap();
         }
 
-        group.bench_with_input(
-            BenchmarkId::new("scan_200", shards),
-            &shards,
-            |b, _| {
-                b.iter(|| {
-                    black_box(
-                        cluster
-                            .query("MATCH (p:Person) RETURN p.name")
-                            .unwrap(),
-                    );
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("scan_200", shards), &shards, |b, _| {
+            b.iter(|| {
+                black_box(cluster.query("MATCH (p:Person) RETURN p.name").unwrap());
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("count_200", shards),
-            &shards,
-            |b, _| {
-                b.iter(|| {
-                    black_box(
-                        cluster.query("MATCH (p:Person) RETURN COUNT(*)").unwrap(),
-                    );
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("count_200", shards), &shards, |b, _| {
+            b.iter(|| {
+                black_box(cluster.query("MATCH (p:Person) RETURN COUNT(*)").unwrap());
+            });
+        });
     }
     group.finish();
 }
@@ -414,10 +396,7 @@ fn bench_memory_overhead(c: &mut Criterion) {
             || Shard::new(0),
             |mut shard| {
                 for i in 0..10_000 {
-                    shard.create_node(
-                        Some("N"),
-                        &[("v".into(), Value::Int(i))],
-                    );
+                    shard.create_node(Some("N"), &[("v".into(), Value::Int(i))]);
                 }
                 black_box(&shard);
             },

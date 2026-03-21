@@ -1,3 +1,4 @@
+pub mod affinity;
 pub mod cluster;
 pub mod database;
 pub mod event_loop;

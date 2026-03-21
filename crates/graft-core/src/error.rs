@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::id::{NodeId, EdgeId, PageId};
+use crate::id::{EdgeId, NodeId, PageId};
 
 pub type Result<T> = std::result::Result<T, Error>;
 

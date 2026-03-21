@@ -162,10 +162,7 @@ impl BufferPool {
     }
 
     /// Create a fresh page in the pool (for newly allocated pages).
-    pub fn create(
-        &mut self,
-        page: Page,
-    ) -> Result<(PageId, Option<EvictedPage>), BufferPoolError> {
+    pub fn create(&mut self, page: Page) -> Result<(PageId, Option<EvictedPage>), BufferPoolError> {
         let page_id = page.page_id();
         if self.page_table.contains_key(&page_id) {
             return Err(BufferPoolError::AlreadyLoaded(page_id));

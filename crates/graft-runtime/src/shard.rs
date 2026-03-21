@@ -56,7 +56,12 @@ fn page_file_offset(page_id: PageId) -> u64 {
     (page_id - 1) * PAGE_SIZE as u64
 }
 
-fn value_to_prop_record(entity_id: u64, entity_type: u8, key: &str, value: &Value) -> PropertyRecord {
+fn value_to_prop_record(
+    entity_id: u64,
+    entity_type: u8,
+    key: &str,
+    value: &Value,
+) -> PropertyRecord {
     match value {
         Value::Null => PropertyRecord::new_null(entity_id, entity_type, key),
         Value::Int(n) => PropertyRecord::new_int(entity_id, entity_type, key, *n),
@@ -120,6 +125,10 @@ pub struct Shard {
     last_sync_ms: u64,
     commits_since_sync: u32,
 
+    // Replication state
+    read_only: bool,
+    last_applied_lsn: u64,
+
     // I/O + WAL — None for ephemeral shards
     io: Option<RefCell<Box<dyn IoBackend + Send>>>,
     wal: Option<RefCell<WalWriter>>,
@@ -154,6 +163,8 @@ impl Shard {
             next_local_tx: 1,
             last_sync_ms: 0,
             commits_since_sync: 0,
+            read_only: false,
+            last_applied_lsn: 0,
             io: None,
             wal: None,
             node_file: None,
@@ -206,12 +217,51 @@ impl Shard {
         let mut next_prop_page_id: PageId = 1;
         let mut max_tx_id: TxId = 0;
 
+        // --- WAL pass 1: build committed/uncommitted tx sets ---
+        // Must happen BEFORE data file scan so we can filter out records
+        // from aborted transactions that were flushed to data files.
+        let wal_size = io.file_size(wal_fh)?;
+        let mut committed_txs = hashbrown::HashSet::new();
+        let mut uncommitted_txs = hashbrown::HashSet::new();
+        if wal_size > 0 {
+            let mut begun_txs = hashbrown::HashSet::new();
+            let mut reader = WalReader::new(wal_fh, wal_size);
+            while let Some(record) = reader.next(&mut *io) {
+                if record.tx_id > max_tx_id {
+                    max_tx_id = record.tx_id;
+                }
+                match record.record_type {
+                    WalRecordType::Begin => {
+                        begun_txs.insert(record.tx_id);
+                    }
+                    WalRecordType::Commit => {
+                        committed_txs.insert(record.tx_id);
+                    }
+                    _ => {}
+                }
+            }
+            // Uncommitted = began but never committed (aborted or in-flight at crash)
+            for tx_id in &begun_txs {
+                if !committed_txs.contains(tx_id) {
+                    uncommitted_txs.insert(*tx_id);
+                }
+            }
+        }
+
         // --- Scan data files ---
+        // Skip records whose tx_min belongs to an uncommitted transaction.
 
         scan_data_file(
-            &mut *io, node_fh, &mut node_pool,
-            &mut |page, pid, slot, rec_bytes| {
+            &mut *io,
+            node_fh,
+            &mut node_pool,
+            &mut |_page, pid, slot, rec_bytes| {
                 let rec = NodeRecord::read_from(rec_bytes);
+                // Skip records from uncommitted transactions — their data was
+                // flushed to data files during shutdown but should not survive.
+                if uncommitted_txs.contains(&rec.tx_min) {
+                    return;
+                }
                 if !rec.is_deleted() && !rec.node_id.is_null() {
                     node_index.insert(rec.node_id.as_u64(), (pid, slot));
                     let local = rec.node_id.local_id();
@@ -219,19 +269,27 @@ impl Shard {
                         next_node_local = local + 1;
                     }
                 }
-                if rec.tx_min > max_tx_id { max_tx_id = rec.tx_min; }
-                if rec.tx_max > max_tx_id { max_tx_id = rec.tx_max; }
+                if rec.tx_min > max_tx_id {
+                    max_tx_id = rec.tx_min;
+                }
+                if rec.tx_max > max_tx_id {
+                    max_tx_id = rec.tx_max;
+                }
                 if pid >= next_node_page_id {
                     next_node_page_id = pid + 1;
                 }
-                let _ = page;
             },
         )?;
 
         scan_data_file(
-            &mut *io, edge_fh, &mut edge_pool,
+            &mut *io,
+            edge_fh,
+            &mut edge_pool,
             &mut |_page, pid, slot, rec_bytes| {
                 let rec = EdgeRecord::read_from(rec_bytes);
+                if uncommitted_txs.contains(&rec.tx_min) {
+                    return;
+                }
                 if !rec.is_deleted() && !rec.edge_id.is_null() {
                     edge_index.insert(rec.edge_id.as_u64(), (pid, slot));
                     let local = rec.edge_id.local_id();
@@ -239,8 +297,12 @@ impl Shard {
                         next_edge_local = local + 1;
                     }
                 }
-                if rec.tx_min > max_tx_id { max_tx_id = rec.tx_min; }
-                if rec.tx_max > max_tx_id { max_tx_id = rec.tx_max; }
+                if rec.tx_min > max_tx_id {
+                    max_tx_id = rec.tx_min;
+                }
+                if rec.tx_max > max_tx_id {
+                    max_tx_id = rec.tx_max;
+                }
                 if pid >= next_edge_page_id {
                     next_edge_page_id = pid + 1;
                 }
@@ -248,7 +310,9 @@ impl Shard {
         )?;
 
         scan_data_file(
-            &mut *io, prop_fh, &mut prop_pool,
+            &mut *io,
+            prop_fh,
+            &mut prop_pool,
             &mut |_page, pid, slot, rec_bytes| {
                 let rec = PropertyRecord::read_from(rec_bytes);
                 if rec.entity_id != 0 {
@@ -280,21 +344,8 @@ impl Shard {
             }
         }
 
-        // --- WAL replay (two-pass for transaction awareness) ---
-        let wal_size = io.file_size(wal_fh)?;
+        // --- WAL pass 2: replay only committed records ---
         if wal_size > 0 {
-            // Pass 1: build committed tx set and find max tx_id
-            let mut committed_txs = hashbrown::HashSet::new();
-            {
-                let mut reader = WalReader::new(wal_fh, wal_size);
-                while let Some(record) = reader.next(&mut *io) {
-                    if record.tx_id > max_tx_id { max_tx_id = record.tx_id; }
-                    if record.record_type == WalRecordType::Commit {
-                        committed_txs.insert(record.tx_id);
-                    }
-                }
-            }
-
             // Pass 2: replay only committed (or pre-MVCC tx_id==0) records
             let mut reader = WalReader::new(wal_fh, wal_size);
             while let Some(record) = reader.next(&mut *io) {
@@ -303,36 +354,78 @@ impl Shard {
                     continue;
                 }
                 match record.body {
-                    WalBody::PageWrite { page_id, slot, page_type, data } => {
+                    WalBody::PageWrite {
+                        page_id,
+                        slot,
+                        page_type,
+                        data,
+                    } => {
                         match page_type {
-                            1 => { // Node
-                                ensure_pool_has_page(&mut *io, node_fh, &mut node_pool, page_id, PageType::Node);
+                            1 => {
+                                // Node
+                                ensure_pool_has_page(
+                                    &mut *io,
+                                    node_fh,
+                                    &mut node_pool,
+                                    page_id,
+                                    PageType::Node,
+                                );
                                 write_record_to_pool(&mut node_pool, page_id, slot, &data);
                                 let rec = NodeRecord::read_from(&data);
                                 if !rec.is_deleted() && !rec.node_id.is_null() {
                                     node_index.insert(rec.node_id.as_u64(), (page_id, slot));
                                     let local = rec.node_id.local_id();
-                                    if local >= next_node_local { next_node_local = local + 1; }
+                                    if local >= next_node_local {
+                                        next_node_local = local + 1;
+                                    }
                                 }
-                                if rec.tx_min > max_tx_id { max_tx_id = rec.tx_min; }
-                                if rec.tx_max > max_tx_id { max_tx_id = rec.tx_max; }
-                                if page_id >= next_node_page_id { next_node_page_id = page_id + 1; }
+                                if rec.tx_min > max_tx_id {
+                                    max_tx_id = rec.tx_min;
+                                }
+                                if rec.tx_max > max_tx_id {
+                                    max_tx_id = rec.tx_max;
+                                }
+                                if page_id >= next_node_page_id {
+                                    next_node_page_id = page_id + 1;
+                                }
                             }
-                            2 => { // Edge
-                                ensure_pool_has_page(&mut *io, edge_fh, &mut edge_pool, page_id, PageType::Edge);
+                            2 => {
+                                // Edge
+                                ensure_pool_has_page(
+                                    &mut *io,
+                                    edge_fh,
+                                    &mut edge_pool,
+                                    page_id,
+                                    PageType::Edge,
+                                );
                                 write_record_to_pool(&mut edge_pool, page_id, slot, &data);
                                 let rec = EdgeRecord::read_from(&data);
                                 if !rec.is_deleted() && !rec.edge_id.is_null() {
                                     edge_index.insert(rec.edge_id.as_u64(), (page_id, slot));
                                     let local = rec.edge_id.local_id();
-                                    if local >= next_edge_local { next_edge_local = local + 1; }
+                                    if local >= next_edge_local {
+                                        next_edge_local = local + 1;
+                                    }
                                 }
-                                if rec.tx_min > max_tx_id { max_tx_id = rec.tx_min; }
-                                if rec.tx_max > max_tx_id { max_tx_id = rec.tx_max; }
-                                if page_id >= next_edge_page_id { next_edge_page_id = page_id + 1; }
+                                if rec.tx_min > max_tx_id {
+                                    max_tx_id = rec.tx_min;
+                                }
+                                if rec.tx_max > max_tx_id {
+                                    max_tx_id = rec.tx_max;
+                                }
+                                if page_id >= next_edge_page_id {
+                                    next_edge_page_id = page_id + 1;
+                                }
                             }
-                            3 => { // Property
-                                ensure_pool_has_page(&mut *io, prop_fh, &mut prop_pool, page_id, PageType::PropertyOverflow);
+                            3 => {
+                                // Property
+                                ensure_pool_has_page(
+                                    &mut *io,
+                                    prop_fh,
+                                    &mut prop_pool,
+                                    page_id,
+                                    PageType::PropertyOverflow,
+                                );
                                 write_record_to_pool(&mut prop_pool, page_id, slot, &data);
                                 let rec = PropertyRecord::read_from(&data);
                                 if rec.entity_id != 0 {
@@ -342,9 +435,12 @@ impl Shard {
                                     };
                                     idx.insert((rec.entity_id, rec.key.clone()), (page_id, slot));
                                 }
-                                if page_id >= next_prop_page_id { next_prop_page_id = page_id + 1; }
+                                if page_id >= next_prop_page_id {
+                                    next_prop_page_id = page_id + 1;
+                                }
                             }
-                            4 => { // Label
+                            4 => {
+                                // Label
                                 let (lid, name) = LabelDictionary::read_label_record(&data);
                                 if lid != LabelId::NONE && !name.is_empty() {
                                     labels.insert_label(lid, &name);
@@ -353,29 +449,31 @@ impl Shard {
                             _ => {}
                         }
                     }
-                    WalBody::PageClear { page_id, slot, page_type } => {
-                        match page_type {
-                            1 => {
-                                if let Some(fid) = node_pool.pin(page_id) {
-                                    node_pool.page_mut(fid).free_slot(slot);
-                                    node_pool.unpin(fid);
-                                }
+                    WalBody::PageClear {
+                        page_id,
+                        slot,
+                        page_type,
+                    } => match page_type {
+                        1 => {
+                            if let Some(fid) = node_pool.pin(page_id) {
+                                node_pool.page_mut(fid).free_slot(slot);
+                                node_pool.unpin(fid);
                             }
-                            2 => {
-                                if let Some(fid) = edge_pool.pin(page_id) {
-                                    edge_pool.page_mut(fid).free_slot(slot);
-                                    edge_pool.unpin(fid);
-                                }
-                            }
-                            3 => {
-                                if let Some(fid) = prop_pool.pin(page_id) {
-                                    prop_pool.page_mut(fid).free_slot(slot);
-                                    prop_pool.unpin(fid);
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        2 => {
+                            if let Some(fid) = edge_pool.pin(page_id) {
+                                edge_pool.page_mut(fid).free_slot(slot);
+                                edge_pool.unpin(fid);
+                            }
+                        }
+                        3 => {
+                            if let Some(fid) = prop_pool.pin(page_id) {
+                                prop_pool.page_mut(fid).free_slot(slot);
+                                prop_pool.unpin(fid);
+                            }
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -426,6 +524,8 @@ impl Shard {
             next_local_tx,
             last_sync_ms: 0,
             commits_since_sync: 0,
+            read_only: false,
+            last_applied_lsn: 0,
             io: Some(RefCell::new(io)),
             wal: Some(RefCell::new(wal)),
             node_file: Some(node_fh),
@@ -446,6 +546,180 @@ impl Shard {
         self.next_local_tx
     }
 
+    /// Whether this shard is in read-only mode (replica).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Set read-only mode. When true, mutations return without effect.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    /// The last LSN applied from replication.
+    pub fn last_applied_lsn(&self) -> u64 {
+        self.last_applied_lsn
+    }
+
+    /// Apply a single WAL record to this shard (used by replication receiver).
+    ///
+    /// This applies the record directly to the in-memory data structures
+    /// (buffer pools, indexes) without writing to the local WAL — the
+    /// replica's WAL is the record stream from the primary.
+    pub fn apply_wal_record(
+        &mut self,
+        record: &graft_txn::wal::WalRecord,
+    ) {
+        use graft_storage::page::PageType;
+        use graft_storage::record::{ENTITY_TYPE_NODE};
+        use graft_storage::{EdgeRecord, NodeRecord, PropertyRecord};
+        use graft_txn::wal::{WalBody, WalRecordType};
+
+        match &record.body {
+            WalBody::PageWrite {
+                page_id,
+                slot,
+                page_type,
+                data,
+            } => {
+                match *page_type {
+                    1 => {
+                        // Node
+                        Self::ensure_pool_has_page_inline(
+                            &mut self.node_pool,
+                            *page_id,
+                            PageType::Node,
+                        );
+                        Self::write_record_to_pool_inline(&mut self.node_pool, *page_id, *slot, data);
+                        let rec = NodeRecord::read_from(data);
+                        if !rec.is_deleted() && !rec.node_id.is_null() {
+                            self.node_index.insert(rec.node_id.as_u64(), (*page_id, *slot));
+                            let local = rec.node_id.local_id();
+                            if local >= self.next_node_local {
+                                self.next_node_local = local + 1;
+                            }
+                        }
+                        if rec.tx_min > 0 {
+                            self.tx_mgr.advance_past(rec.tx_min);
+                        }
+                        if *page_id >= self.next_node_page_id {
+                            self.next_node_page_id = *page_id + 1;
+                        }
+                    }
+                    2 => {
+                        // Edge
+                        Self::ensure_pool_has_page_inline(
+                            &mut self.edge_pool,
+                            *page_id,
+                            PageType::Edge,
+                        );
+                        Self::write_record_to_pool_inline(&mut self.edge_pool, *page_id, *slot, data);
+                        let rec = EdgeRecord::read_from(data);
+                        if !rec.is_deleted() && !rec.edge_id.is_null() {
+                            self.edge_index.insert(rec.edge_id.as_u64(), (*page_id, *slot));
+                            let local = rec.edge_id.local_id();
+                            if local >= self.next_edge_local {
+                                self.next_edge_local = local + 1;
+                            }
+                        }
+                        if rec.tx_min > 0 {
+                            self.tx_mgr.advance_past(rec.tx_min);
+                        }
+                        if *page_id >= self.next_edge_page_id {
+                            self.next_edge_page_id = *page_id + 1;
+                        }
+                    }
+                    3 => {
+                        // Property
+                        Self::ensure_pool_has_page_inline(
+                            &mut self.prop_pool,
+                            *page_id,
+                            PageType::PropertyOverflow,
+                        );
+                        Self::write_record_to_pool_inline(&mut self.prop_pool, *page_id, *slot, data);
+                        let rec = PropertyRecord::read_from(data);
+                        if rec.entity_id != 0 {
+                            let idx = match rec.entity_type {
+                                ENTITY_TYPE_NODE => &mut self.node_prop_index,
+                                _ => &mut self.edge_prop_index,
+                            };
+                            idx.insert((rec.entity_id, rec.key.clone()), (*page_id, *slot));
+                        }
+                        if *page_id >= self.next_prop_page_id {
+                            self.next_prop_page_id = *page_id + 1;
+                        }
+                    }
+                    4 => {
+                        // Label
+                        let (lid, name) = LabelDictionary::read_label_record(data);
+                        if lid != LabelId::NONE && !name.is_empty() {
+                            self.labels.insert_label(lid, &name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WalBody::PageClear {
+                page_id,
+                slot,
+                page_type,
+            } => {
+                let pool = match *page_type {
+                    1 => &self.node_pool,
+                    2 => &self.edge_pool,
+                    3 => &self.prop_pool,
+                    _ => return,
+                };
+                let mut p = pool.borrow_mut();
+                if let Some(fid) = p.pin(*page_id) {
+                    p.page_mut(fid).free_slot(*slot);
+                    p.unpin(fid);
+                }
+            }
+            WalBody::Empty => {
+                // Begin/Commit/Abort — update tx manager state
+                match record.record_type {
+                    WalRecordType::Begin => {
+                        self.tx_mgr.advance_past(record.tx_id);
+                    }
+                    WalRecordType::Commit => {
+                        self.tx_mgr.mark_committed(record.tx_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.last_applied_lsn = record.lsn;
+    }
+
+    /// Inline helper: ensure a page exists in a pool (for apply_wal_record).
+    fn ensure_pool_has_page_inline(
+        pool: &mut RefCell<BufferPool>,
+        page_id: PageId,
+        page_type: graft_storage::page::PageType,
+    ) {
+        let mut p = pool.borrow_mut();
+        if !p.contains(page_id) {
+            let page = Page::new(page_id, page_type);
+            let _ = p.create(page);
+        }
+    }
+
+    /// Inline helper: write record data to a pool page (for apply_wal_record).
+    fn write_record_to_pool_inline(
+        pool: &mut RefCell<BufferPool>,
+        page_id: PageId,
+        slot: u16,
+        data: &[u8; RECORD_SIZE],
+    ) {
+        let mut p = pool.borrow_mut();
+        if let Some(fid) = p.pin(page_id) {
+            let _ = p.page_mut(fid).write_record(slot, data);
+            p.unpin(fid);
+        }
+    }
+
     /// Flush WAL and all dirty pages to disk. No-op for ephemeral shards.
     pub fn flush(&self) -> std::io::Result<()> {
         let io_cell = match &self.io {
@@ -458,27 +732,75 @@ impl Shard {
             wal.borrow_mut().flush(&mut **io_cell.borrow_mut())?;
         }
 
-        // Flush each pool's dirty pages
-        let pools_and_files: [(&RefCell<BufferPool>, Option<FileHandle>); 3] = [
-            (&self.node_pool, self.node_file),
-            (&self.edge_pool, self.edge_file),
-            (&self.prop_pool, self.prop_file),
-        ];
+        // Collect dirty pages from each pool
+        let node_dirty = self.node_pool.borrow_mut().dirty_pages();
+        let edge_dirty = self.edge_pool.borrow_mut().dirty_pages();
+        let prop_dirty = self.prop_pool.borrow_mut().dirty_pages();
 
-        for (pool_cell, file) in &pools_and_files {
-            let dirty = pool_cell.borrow_mut().dirty_pages();
-            if let Some(fh) = file {
-                if !dirty.is_empty() {
-                    let mut io = io_cell.borrow_mut();
-                    for (page_id, data) in &dirty {
-                        io.write_page(*fh, page_file_offset(*page_id), data)?;
-                    }
-                    io.sync(*fh)?;
-                    drop(io);
+        {
+            let mut io = io_cell.borrow_mut();
+
+            // Batched writes per file
+            if let Some(fh) = self.node_file {
+                if !node_dirty.is_empty() {
+                    let batch: Vec<_> = node_dirty
+                        .iter()
+                        .map(|(pid, data)| (page_file_offset(*pid), data))
+                        .collect();
+                    io.write_pages_batch(fh, &batch)?;
                 }
             }
-            let mut pool = pool_cell.borrow_mut();
-            for (page_id, _) in &dirty {
+            if let Some(fh) = self.edge_file {
+                if !edge_dirty.is_empty() {
+                    let batch: Vec<_> = edge_dirty
+                        .iter()
+                        .map(|(pid, data)| (page_file_offset(*pid), data))
+                        .collect();
+                    io.write_pages_batch(fh, &batch)?;
+                }
+            }
+            if let Some(fh) = self.prop_file {
+                if !prop_dirty.is_empty() {
+                    let batch: Vec<_> = prop_dirty
+                        .iter()
+                        .map(|(pid, data)| (page_file_offset(*pid), data))
+                        .collect();
+                    io.write_pages_batch(fh, &batch)?;
+                }
+            }
+
+            // Batched sync for all files that had dirty pages
+            let mut sync_handles = Vec::new();
+            if self.node_file.is_some() && !node_dirty.is_empty() {
+                sync_handles.push(self.node_file.unwrap());
+            }
+            if self.edge_file.is_some() && !edge_dirty.is_empty() {
+                sync_handles.push(self.edge_file.unwrap());
+            }
+            if self.prop_file.is_some() && !prop_dirty.is_empty() {
+                sync_handles.push(self.prop_file.unwrap());
+            }
+            if !sync_handles.is_empty() {
+                io.sync_batch(&sync_handles)?;
+            }
+        }
+
+        // Clear dirty flags
+        {
+            let mut pool = self.node_pool.borrow_mut();
+            for (page_id, _) in &node_dirty {
+                pool.clear_dirty_page(*page_id);
+            }
+        }
+        {
+            let mut pool = self.edge_pool.borrow_mut();
+            for (page_id, _) in &edge_dirty {
+                pool.clear_dirty_page(*page_id);
+            }
+        }
+        {
+            let mut pool = self.prop_pool.borrow_mut();
+            for (page_id, _) in &prop_dirty {
                 pool.clear_dirty_page(*page_id);
             }
         }
@@ -543,33 +865,44 @@ impl Shard {
     }
 
     fn alloc_node_slot(&mut self) -> (PageId, u16) {
-        let (pid, slot, evicted) = Self::alloc_slot(
-            &self.node_pool, &mut self.next_node_page_id, PageType::Node,
-        );
-        if let Some(ev) = evicted { self.handle_eviction(&ev); }
+        let (pid, slot, evicted) =
+            Self::alloc_slot(&self.node_pool, &mut self.next_node_page_id, PageType::Node);
+        if let Some(ev) = evicted {
+            self.handle_eviction(&ev);
+        }
         (pid, slot)
     }
 
     fn alloc_edge_slot(&mut self) -> (PageId, u16) {
-        let (pid, slot, evicted) = Self::alloc_slot(
-            &self.edge_pool, &mut self.next_edge_page_id, PageType::Edge,
-        );
-        if let Some(ev) = evicted { self.handle_eviction(&ev); }
+        let (pid, slot, evicted) =
+            Self::alloc_slot(&self.edge_pool, &mut self.next_edge_page_id, PageType::Edge);
+        if let Some(ev) = evicted {
+            self.handle_eviction(&ev);
+        }
         (pid, slot)
     }
 
     fn alloc_prop_slot(&mut self) -> (PageId, u16) {
         let (pid, slot, evicted) = Self::alloc_slot(
-            &self.prop_pool, &mut self.next_prop_page_id, PageType::PropertyOverflow,
+            &self.prop_pool,
+            &mut self.next_prop_page_id,
+            PageType::PropertyOverflow,
         );
-        if let Some(ev) = evicted { self.handle_eviction(&ev); }
+        if let Some(ev) = evicted {
+            self.handle_eviction(&ev);
+        }
         (pid, slot)
     }
 
     // -- I/O helpers -----------------------------------------------------------
 
     /// Load a page from disk into the pool if not already present.
-    fn ensure_page_loaded(&self, pool: &RefCell<BufferPool>, file: Option<FileHandle>, page_id: PageId) {
+    fn ensure_page_loaded(
+        &self,
+        pool: &RefCell<BufferPool>,
+        file: Option<FileHandle>,
+        page_id: PageId,
+    ) {
         if pool.borrow().contains(page_id) {
             return;
         }
@@ -579,7 +912,10 @@ impl Shard {
         };
         let mut io = io_cell.borrow_mut();
         let mut buf = [0u8; PAGE_SIZE];
-        if io.read_page(fh, page_file_offset(page_id), &mut buf).is_err() {
+        if io
+            .read_page(fh, page_file_offset(page_id), &mut buf)
+            .is_err()
+        {
             return;
         }
         drop(io);
@@ -712,6 +1048,18 @@ impl Shard {
                 self.last_sync_ms = io.now_millis();
                 self.commits_since_sync = 0;
             }
+        }
+    }
+
+    /// Switch the shard's active transaction context to an already-begun tx.
+    /// Used when the coordinator needs to restore tx context for an explicit
+    /// transaction across serialized connection requests.
+    pub fn set_active_tx(&mut self, tx_id: TxId) {
+        self.current_tx = tx_id;
+        if tx_id == 0 {
+            self.current_snapshot = None;
+        } else {
+            self.current_snapshot = self.tx_mgr.snapshot(tx_id).cloned();
         }
     }
 
@@ -905,7 +1253,8 @@ fn scan_data_file(
                     // Write evicted page back to its file
                     let evicted_type = PageType::from_page_bytes(&evicted.data);
                     if evicted_type.is_some() {
-                        let _ = io.write_page(file, page_file_offset(evicted.page_id), &evicted.data);
+                        let _ =
+                            io.write_page(file, page_file_offset(evicted.page_id), &evicted.data);
                     }
                 }
                 Ok(None) => {}
@@ -928,7 +1277,10 @@ fn ensure_pool_has_page(
     }
     // Try to load from disk
     let mut buf = [0u8; PAGE_SIZE];
-    if io.read_page(file, page_file_offset(page_id), &mut buf).is_ok() {
+    if io
+        .read_page(file, page_file_offset(page_id), &mut buf)
+        .is_ok()
+    {
         let _ = pool.load(page_id, &buf);
         return;
     }
@@ -937,7 +1289,12 @@ fn ensure_pool_has_page(
     let _ = pool.create(page);
 }
 
-fn write_record_to_pool(pool: &mut BufferPool, page_id: PageId, slot: u16, data: &[u8; RECORD_SIZE]) {
+fn write_record_to_pool(
+    pool: &mut BufferPool,
+    page_id: PageId,
+    slot: u16,
+    data: &[u8; RECORD_SIZE],
+) {
     if let Some(fid) = pool.pin(page_id) {
         // Ensure the slot is allocated (during replay the page may be fresh)
         let page = pool.page_mut(fid);
@@ -1110,11 +1467,7 @@ impl StorageAccess for Shard {
         }
     }
 
-    fn create_node(
-        &mut self,
-        label: Option<&str>,
-        properties: &[(String, Value)],
-    ) -> NodeId {
+    fn create_node(&mut self, label: Option<&str>, properties: &[(String, Value)]) -> NodeId {
         let id = self.alloc_node_id();
 
         let is_new_label = label.is_some() && self.labels.get(label.unwrap()).is_none();
@@ -1213,8 +1566,7 @@ impl StorageAccess for Shard {
             return;
         }
         let prop_rec = value_to_prop_record(id.as_u64(), ENTITY_TYPE_NODE, key, value);
-        if let Some(&(page_id, slot)) = self.node_prop_index.get(&(id.as_u64(), key.to_owned()))
-        {
+        if let Some(&(page_id, slot)) = self.node_prop_index.get(&(id.as_u64(), key.to_owned())) {
             self.write_prop_record(page_id, slot, &prop_rec);
         } else {
             let (pp, ps) = self.alloc_prop_slot();
@@ -1229,8 +1581,7 @@ impl StorageAccess for Shard {
             return;
         }
         let prop_rec = value_to_prop_record(id.as_u64(), ENTITY_TYPE_EDGE, key, value);
-        if let Some(&(page_id, slot)) = self.edge_prop_index.get(&(id.as_u64(), key.to_owned()))
-        {
+        if let Some(&(page_id, slot)) = self.edge_prop_index.get(&(id.as_u64(), key.to_owned())) {
             self.write_prop_record(page_id, slot, &prop_rec);
         } else {
             let (pp, ps) = self.alloc_prop_slot();
@@ -1241,7 +1592,11 @@ impl StorageAccess for Shard {
     }
 
     fn delete_node(&mut self, id: NodeId) {
-        let del_tx = if self.current_tx == 0 { 1 } else { self.current_tx };
+        let del_tx = if self.current_tx == 0 {
+            1
+        } else {
+            self.current_tx
+        };
         if let Some(&(page_id, slot)) = self.node_index.get(&id.as_u64()) {
             if let Some(mut rec) = self.read_node_record(page_id, slot) {
                 rec.tx_max = del_tx;
@@ -1251,7 +1606,11 @@ impl StorageAccess for Shard {
     }
 
     fn delete_edge(&mut self, id: EdgeId) {
-        let del_tx = if self.current_tx == 0 { 1 } else { self.current_tx };
+        let del_tx = if self.current_tx == 0 {
+            1
+        } else {
+            self.current_tx
+        };
         if let Some(&(page_id, slot)) = self.edge_index.get(&id.as_u64()) {
             if let Some(mut rec) = self.read_edge_record(page_id, slot) {
                 rec.tx_max = del_tx;
@@ -1284,14 +1643,20 @@ mod tests {
     #[test]
     fn create_and_scan_nodes() {
         let mut shard = Shard::new(0);
-        let id = shard.create_node(Some("Person"), &[("name".into(), Value::String("Alice".into()))]);
+        let id = shard.create_node(
+            Some("Person"),
+            &[("name".into(), Value::String("Alice".into()))],
+        );
         assert!(!id.is_null());
 
         let nodes = shard.scan_nodes(Some("Person"));
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].label.as_deref(), Some("Person"));
 
-        assert_eq!(shard.node_property(id, "name"), Value::String("Alice".into()));
+        assert_eq!(
+            shard.node_property(id, "name"),
+            Value::String("Alice".into())
+        );
         assert_eq!(shard.node_property(id, "missing"), Value::Null);
     }
 
@@ -1313,7 +1678,12 @@ mod tests {
         let mut shard = Shard::new(0);
         let alice = shard.create_node(Some("Person"), &[]);
         let bob = shard.create_node(Some("Person"), &[]);
-        let edge = shard.create_edge(alice, bob, Some("KNOWS"), &[("since".into(), Value::Int(2020))]);
+        let edge = shard.create_edge(
+            alice,
+            bob,
+            Some("KNOWS"),
+            &[("since".into(), Value::Int(2020))],
+        );
 
         let out = shard.outbound_edges(alice, None);
         assert_eq!(out.len(), 1);
@@ -1392,7 +1762,10 @@ mod tests {
             shard.create_node(Some("N"), &[("i".into(), Value::Int(i as i64))]);
         }
         assert_eq!(shard.scan_nodes(Some("N")).len(), count);
-        assert!(shard.next_node_page_id > 2, "should have allocated 2+ pages");
+        assert!(
+            shard.next_node_page_id > 2,
+            "should have allocated 2+ pages"
+        );
     }
 
     #[test]
@@ -1403,36 +1776,54 @@ mod tests {
         let id;
         let edge_id;
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
-            id = shard.create_node(Some("Person"), &[
-                ("name".into(), Value::String("Alice".into())),
-                ("age".into(), Value::Int(30)),
-            ]);
-            let bob = shard.create_node(Some("Person"), &[
-                ("name".into(), Value::String("Bob".into())),
-            ]);
-            edge_id = shard.create_edge(id, bob, Some("KNOWS"), &[
-                ("since".into(), Value::Int(2024)),
-            ]);
+            id = shard.create_node(
+                Some("Person"),
+                &[
+                    ("name".into(), Value::String("Alice".into())),
+                    ("age".into(), Value::Int(30)),
+                ],
+            );
+            let bob = shard.create_node(
+                Some("Person"),
+                &[("name".into(), Value::String("Bob".into()))],
+            );
+            edge_id = shard.create_edge(
+                id,
+                bob,
+                Some("KNOWS"),
+                &[("since".into(), Value::Int(2024))],
+            );
 
             shard.flush().unwrap();
         }
 
         // Re-open and verify data survives
         {
-            let shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
             let nodes = shard.scan_nodes(Some("Person"));
             assert_eq!(nodes.len(), 2);
 
-            assert_eq!(shard.node_property(id, "name"), Value::String("Alice".into()));
+            assert_eq!(
+                shard.node_property(id, "name"),
+                Value::String("Alice".into())
+            );
             assert_eq!(shard.node_property(id, "age"), Value::Int(30));
 
             let out = shard.outbound_edges(id, Some("KNOWS"));
@@ -1448,14 +1839,16 @@ mod tests {
         // Create data but DON'T flush — only WAL protects it
         let id;
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
-            id = shard.create_node(Some("X"), &[
-                ("v".into(), Value::Int(42)),
-            ]);
+            id = shard.create_node(Some("X"), &[("v".into(), Value::Int(42))]);
 
             // Flush WAL only (not dirty pages) — simulates crash after WAL write
             if let Some(ref wal) = shard.wal {
@@ -1468,10 +1861,14 @@ mod tests {
 
         // Re-open — WAL replay should recover the data
         {
-            let shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
             let nodes = shard.scan_nodes(Some("X"));
             assert_eq!(nodes.len(), 1);
@@ -1483,12 +1880,15 @@ mod tests {
     fn shard_property_pages() {
         // Verify property page system works identically to old HashMap approach
         let mut shard = Shard::new(0);
-        let a = shard.create_node(None, &[
-            ("name".into(), Value::String("test".into())),
-            ("x".into(), Value::Int(1)),
-            ("f".into(), Value::Float(2.5)),
-            ("b".into(), Value::Bool(true)),
-        ]);
+        let a = shard.create_node(
+            None,
+            &[
+                ("name".into(), Value::String("test".into())),
+                ("x".into(), Value::Int(1)),
+                ("f".into(), Value::Float(2.5)),
+                ("b".into(), Value::Bool(true)),
+            ],
+        );
         assert_eq!(shard.node_property(a, "name"), Value::String("test".into()));
         assert_eq!(shard.node_property(a, "x"), Value::Int(1));
         assert_eq!(shard.node_property(a, "f"), Value::Float(2.5));
@@ -1510,15 +1910,17 @@ mod tests {
         let mut ids = Vec::new();
 
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 4,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 4,
+                },
+            )
+            .unwrap();
 
             for i in 0..node_count {
-                let id = shard.create_node(None, &[
-                    ("idx".into(), Value::Int(i as i64)),
-                ]);
+                let id = shard.create_node(None, &[("idx".into(), Value::Int(i as i64))]);
                 ids.push(id);
             }
 
@@ -1527,10 +1929,14 @@ mod tests {
 
         // Re-open with the same tiny pool — recovery must page-in from disk
         {
-            let shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 4,
-            }).unwrap();
+            let shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 4,
+                },
+            )
+            .unwrap();
 
             // Verify every node is readable (will require page faults from disk)
             for (i, &id) in ids.iter().enumerate() {
@@ -1651,10 +2057,14 @@ mod tests {
         // Create data in committed transactions
         let id;
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
             shard.begin_tx();
             id = shard.create_node(Some("X"), &[("v".into(), Value::Int(42))]);
@@ -1670,10 +2080,14 @@ mod tests {
 
         // Re-open — committed tx should be replayed
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
             shard.begin_tx();
             let nodes = shard.scan_nodes(Some("X"));
@@ -1689,10 +2103,14 @@ mod tests {
 
         // Create data in an uncommitted transaction (begin but no commit)
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
             shard.begin_tx();
             shard.create_node(Some("X"), &[("v".into(), Value::Int(42))]);
@@ -1708,14 +2126,22 @@ mod tests {
 
         // Re-open — uncommitted tx should NOT be replayed
         {
-            let mut shard = Shard::open(0, &ShardConfig {
-                data_dir: dir.path().to_owned(),
-                pool_capacity: 64,
-            }).unwrap();
+            let mut shard = Shard::open(
+                0,
+                &ShardConfig {
+                    data_dir: dir.path().to_owned(),
+                    pool_capacity: 64,
+                },
+            )
+            .unwrap();
 
             shard.begin_tx();
             let nodes = shard.scan_nodes(Some("X"));
-            assert_eq!(nodes.len(), 0, "uncommitted writes should not survive recovery");
+            assert_eq!(
+                nodes.len(),
+                0,
+                "uncommitted writes should not survive recovery"
+            );
             shard.commit_tx();
         }
     }

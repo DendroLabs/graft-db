@@ -125,11 +125,9 @@ impl Page {
     }
 
     pub fn page_type(&self) -> Result<PageType> {
-        PageType::from_u8(self.data[OFF_PAGE_TYPE]).ok_or_else(|| {
-            graft_core::Error::CorruptPage {
-                page: self.page_id(),
-                detail: format!("invalid page type byte: {:#04x}", self.data[OFF_PAGE_TYPE]),
-            }
+        PageType::from_u8(self.data[OFF_PAGE_TYPE]).ok_or_else(|| graft_core::Error::CorruptPage {
+            page: self.page_id(),
+            detail: format!("invalid page type byte: {:#04x}", self.data[OFF_PAGE_TYPE]),
         })
     }
 
@@ -151,8 +149,7 @@ impl Page {
         }
         // Read next pointer from the free slot
         let off = Self::slot_offset(head);
-        let next =
-            u16::from_le_bytes(self.data[off..off + 2].try_into().unwrap());
+        let next = u16::from_le_bytes(self.data[off..off + 2].try_into().unwrap());
         self.set_free_head(next);
         // Zero the slot
         self.data[off..off + RECORD_SIZE].fill(0);
@@ -258,7 +255,11 @@ impl Page {
     }
 
     fn stored_checksum(&self) -> u32 {
-        u32::from_le_bytes(self.data[OFF_CHECKSUM..OFF_CHECKSUM + 4].try_into().unwrap())
+        u32::from_le_bytes(
+            self.data[OFF_CHECKSUM..OFF_CHECKSUM + 4]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     fn slot_offset(slot: u16) -> usize {
@@ -267,7 +268,10 @@ impl Page {
 
     fn checked_slot_offset(page_id: PageId, slot: u16) -> Result<usize> {
         if (slot as usize) >= RECORDS_PER_PAGE {
-            return Err(graft_core::Error::SlotOutOfRange { page: page_id, slot });
+            return Err(graft_core::Error::SlotOutOfRange {
+                page: page_id,
+                slot,
+            });
         }
         Ok(Self::slot_offset(slot))
     }

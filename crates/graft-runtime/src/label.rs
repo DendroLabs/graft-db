@@ -52,9 +52,13 @@ impl LabelDictionary {
         if id == LabelId::NONE {
             return None;
         }
-        self.to_id
-            .iter()
-            .find_map(|(name, lid)| if *lid == id { Some(name.as_str()) } else { None })
+        self.to_id.iter().find_map(|(name, lid)| {
+            if *lid == id {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
     }
 
     /// Insert a label with a specific ID (for recovery).

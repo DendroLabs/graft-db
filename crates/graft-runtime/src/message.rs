@@ -9,7 +9,6 @@ use graft_query::executor::{EdgeInfo, NodeInfo, Value};
 #[derive(Debug)]
 pub enum ShardMessage {
     // -- Requests (shard A asks shard B) -------------------------------------
-
     /// Request: scan nodes with optional label filter on the target shard.
     ScanNodes {
         request_id: u64,
@@ -49,7 +48,6 @@ pub enum ShardMessage {
     },
 
     // -- Responses -----------------------------------------------------------
-
     /// Response: here are the nodes from a scan.
     ScanNodesResult {
         request_id: u64,
@@ -63,10 +61,7 @@ pub enum ShardMessage {
     },
 
     /// Response: here is a property value.
-    GetNodePropertyResult {
-        request_id: u64,
-        value: Value,
-    },
+    GetNodePropertyResult { request_id: u64, value: Value },
 
     /// Response: here are the edges.
     EdgesResult {

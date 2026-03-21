@@ -178,7 +178,10 @@ impl IoBackend for SimIoBackend {
             self.free_slots.push(handle.0);
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid file handle"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid file handle",
+            ))
         }
     }
 
@@ -224,17 +227,26 @@ impl IoBackend for SimIoBackend {
         self.check_fault()?;
         let sh = self.get_handle(handle)?;
         if !sh.readable {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not readable"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not readable",
+            ));
         }
         let path = sh.path.clone();
-        let data = self.files.get(&path)
+        let data = self
+            .files
+            .get(&path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
         let start = offset as usize;
         let end = start + PAGE_SIZE;
         if end > data.data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("read_page at offset {} but file is {} bytes", offset, data.data.len()),
+                format!(
+                    "read_page at offset {} but file is {} bytes",
+                    offset,
+                    data.data.len()
+                ),
             ));
         }
         buf.copy_from_slice(&data.data[start..end]);
@@ -250,7 +262,10 @@ impl IoBackend for SimIoBackend {
         self.check_fault()?;
         let sh = self.get_handle(handle)?;
         if !sh.writable {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not writable"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not writable",
+            ));
         }
         let path = sh.path.clone();
         let data = self.get_file_data_mut(&path)?;
@@ -263,19 +278,19 @@ impl IoBackend for SimIoBackend {
         Ok(())
     }
 
-    fn read_at(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> io::Result<usize> {
+    fn read_at(&mut self, handle: FileHandle, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         self.check_fault()?;
         let sh = self.get_handle(handle)?;
         if !sh.readable {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not readable"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not readable",
+            ));
         }
         let path = sh.path.clone();
-        let data = self.files.get(&path)
+        let data = self
+            .files
+            .get(&path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file not found"))?;
         let start = offset as usize;
         if start >= data.data.len() {
@@ -287,16 +302,14 @@ impl IoBackend for SimIoBackend {
         Ok(n)
     }
 
-    fn write_at(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> io::Result<usize> {
+    fn write_at(&mut self, handle: FileHandle, offset: u64, data: &[u8]) -> io::Result<usize> {
         self.check_fault()?;
         let sh = self.get_handle(handle)?;
         if !sh.writable {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not writable"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not writable",
+            ));
         }
         let path = sh.path.clone();
         let file_data = self.get_file_data_mut(&path)?;
@@ -365,7 +378,9 @@ mod tests {
     #[test]
     fn read_beyond_eof() {
         let mut io = SimIoBackend::new(42);
-        let fh = io.open(&test_path("small"), &OpenOptions::create_read_write()).unwrap();
+        let fh = io
+            .open(&test_path("small"), &OpenOptions::create_read_write())
+            .unwrap();
         // File is empty, reading a page should fail
         let mut buf = [0u8; PAGE_SIZE];
         let result = io.read_page(fh, 0, &mut buf);
@@ -515,7 +530,12 @@ mod tests {
     fn write_only_handle_cannot_read() {
         let mut io = SimIoBackend::new(42);
         let path = test_path("wo");
-        let opts = OpenOptions { read: false, write: true, create: true, truncate: false };
+        let opts = OpenOptions {
+            read: false,
+            write: true,
+            create: true,
+            truncate: false,
+        };
         let fh = io.open(&path, &opts).unwrap();
         io.write_at(fh, 0, b"data").unwrap();
 

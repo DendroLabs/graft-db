@@ -278,23 +278,97 @@ impl IoBackend for IoUringBackend {
         Ok(())
     }
 
-    // WAL I/O: use pread/pwrite (small sequential writes, not worth io_uring overhead)
-    fn read_at(
+    fn write_pages_batch(
         &mut self,
         handle: FileHandle,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> io::Result<usize> {
+        pages: &[(u64, &[u8; PAGE_SIZE])],
+    ) -> io::Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let fd = self.get_fd(handle)?;
+
+        // Process in chunks that fit the SQ capacity
+        for chunk in pages.chunks(RING_ENTRIES as usize) {
+            // Push all SQEs
+            for &(offset, data) in chunk {
+                let sqe = opcode::Write::new(types::Fd(fd), data.as_ptr(), PAGE_SIZE as u32)
+                    .offset(offset)
+                    .build();
+                unsafe {
+                    self.ring
+                        .submission()
+                        .push(&sqe)
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                }
+            }
+
+            // Submit all and wait for all completions
+            self.ring.submit_and_wait(chunk.len())?;
+
+            // Reap all CQEs
+            let mut completed = 0;
+            for cqe in &mut self.ring.completion() {
+                let result = cqe.result();
+                if result < 0 {
+                    return Err(io::Error::from_raw_os_error(-result));
+                }
+                if (result as usize) < PAGE_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("short write in batch: {result} < {PAGE_SIZE}"),
+                    ));
+                }
+                completed += 1;
+            }
+            debug_assert_eq!(completed, chunk.len());
+        }
+        Ok(())
+    }
+
+    fn sync_batch(&mut self, handles: &[FileHandle]) -> io::Result<()> {
+        if handles.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in handles.chunks(RING_ENTRIES as usize) {
+            for &handle in chunk {
+                let entry = self.get_entry(handle)?;
+                let fd = entry.file.as_raw_fd();
+                let sqe = if entry.direct {
+                    opcode::Fsync::new(types::Fd(fd))
+                        .flags(types::FsyncFlags::DATASYNC)
+                        .build()
+                } else {
+                    opcode::Fsync::new(types::Fd(fd)).build()
+                };
+                unsafe {
+                    self.ring
+                        .submission()
+                        .push(&sqe)
+                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                }
+            }
+
+            self.ring.submit_and_wait(chunk.len())?;
+
+            for cqe in &mut self.ring.completion() {
+                let result = cqe.result();
+                if result < 0 {
+                    return Err(io::Error::from_raw_os_error(-result));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // WAL I/O: use pread/pwrite (small sequential writes, not worth io_uring overhead)
+    fn read_at(&mut self, handle: FileHandle, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let file = self.get_file(handle)?;
         file.read_at(buf, offset)
     }
 
-    fn write_at(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> io::Result<usize> {
+    fn write_at(&mut self, handle: FileHandle, offset: u64, data: &[u8]) -> io::Result<usize> {
         let file = self.get_file(handle)?;
         file.write_at(data, offset)
     }

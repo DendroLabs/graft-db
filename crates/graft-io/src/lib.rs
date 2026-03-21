@@ -34,15 +34,30 @@ pub struct OpenOptions {
 
 impl OpenOptions {
     pub fn read() -> Self {
-        Self { read: true, write: false, create: false, truncate: false }
+        Self {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        }
     }
 
     pub fn read_write() -> Self {
-        Self { read: true, write: true, create: false, truncate: false }
+        Self {
+            read: true,
+            write: true,
+            create: false,
+            truncate: false,
+        }
     }
 
     pub fn create_read_write() -> Self {
-        Self { read: true, write: true, create: true, truncate: false }
+        Self {
+            read: true,
+            write: true,
+            create: true,
+            truncate: false,
+        }
     }
 }
 
@@ -96,19 +111,31 @@ pub trait IoBackend: Send {
 
     // -- arbitrary byte I/O (WAL) -------------------------------------------
 
-    fn read_at(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> io::Result<usize>;
+    fn read_at(&mut self, handle: FileHandle, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 
-    fn write_at(
+    fn write_at(&mut self, handle: FileHandle, offset: u64, data: &[u8]) -> io::Result<usize>;
+
+    // -- batched page I/O ---------------------------------------------------
+
+    /// Write multiple pages in a single batch. Default: sequential writes.
+    fn write_pages_batch(
         &mut self,
         handle: FileHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> io::Result<usize>;
+        pages: &[(u64, &[u8; PAGE_SIZE])],
+    ) -> io::Result<()> {
+        for &(offset, data) in pages {
+            self.write_page(handle, offset, data)?;
+        }
+        Ok(())
+    }
+
+    /// Sync multiple files in a single batch. Default: sequential syncs.
+    fn sync_batch(&mut self, handles: &[FileHandle]) -> io::Result<()> {
+        for &handle in handles {
+            self.sync(handle)?;
+        }
+        Ok(())
+    }
 
     // -- clock (monotonic milliseconds) -------------------------------------
 

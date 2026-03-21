@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use graft_storage::{Page, PageType, NodeRecord, EdgeRecord};
-use graft_core::{NodeId, EdgeId, LabelId};
+use graft_core::{EdgeId, LabelId, NodeId};
+use graft_storage::{EdgeRecord, NodeRecord, Page, PageType};
 
 fn bench_page_alloc_free(c: &mut Criterion) {
     c.bench_function("page_alloc_slot", |b| {
@@ -69,5 +69,10 @@ fn bench_checksum(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_page_alloc_free, bench_record_write_read, bench_checksum);
+criterion_group!(
+    benches,
+    bench_page_alloc_free,
+    bench_record_write_read,
+    bench_checksum
+);
 criterion_main!(benches);

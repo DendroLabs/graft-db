@@ -249,9 +249,7 @@ impl<'input> Lexer<'input> {
             self.advance();
         }
         // Check for decimal point followed by digit
-        if self.peek() == Some('.')
-            && self.peek_next().is_some_and(|c| c.is_ascii_digit())
-        {
+        if self.peek() == Some('.') && self.peek_next().is_some_and(|c| c.is_ascii_digit()) {
             self.advance(); // consume .
             while self.peek().is_some_and(|c| c.is_ascii_digit()) {
                 self.advance();
@@ -452,16 +450,22 @@ mod tests {
 
     #[test]
     fn keywords_case_insensitive() {
-        assert_eq!(lex("match MATCH Match"), vec![Token::Match, Token::Match, Token::Match]);
+        assert_eq!(
+            lex("match MATCH Match"),
+            vec![Token::Match, Token::Match, Token::Match]
+        );
     }
 
     #[test]
     fn identifiers() {
-        assert_eq!(lex("foo bar_1 _x"), vec![
-            Token::Ident("foo".into()),
-            Token::Ident("bar_1".into()),
-            Token::Ident("_x".into()),
-        ]);
+        assert_eq!(
+            lex("foo bar_1 _x"),
+            vec![
+                Token::Ident("foo".into()),
+                Token::Ident("bar_1".into()),
+                Token::Ident("_x".into()),
+            ]
+        );
     }
 
     #[test]
@@ -473,7 +477,10 @@ mod tests {
     fn strings() {
         assert_eq!(
             lex("'hello' \"world\""),
-            vec![Token::StringLit("hello".into()), Token::StringLit("world".into())]
+            vec![
+                Token::StringLit("hello".into()),
+                Token::StringLit("world".into())
+            ]
         );
     }
 
@@ -492,42 +499,72 @@ mod tests {
 
     #[test]
     fn comparison_operators() {
-        assert_eq!(lex("= <> < > <= >="), vec![
-            Token::Eq, Token::Neq, Token::Lt, Token::Gt, Token::Lte, Token::Gte,
-        ]);
+        assert_eq!(
+            lex("= <> < > <= >="),
+            vec![
+                Token::Eq,
+                Token::Neq,
+                Token::Lt,
+                Token::Gt,
+                Token::Lte,
+                Token::Gte,
+            ]
+        );
     }
 
     #[test]
     fn symbols() {
-        assert_eq!(lex("()[]{}:,. + * / %"), vec![
-            Token::LParen, Token::RParen, Token::LBracket, Token::RBracket,
-            Token::LBrace, Token::RBrace, Token::Colon, Token::Comma, Token::Dot,
-            Token::Plus, Token::Star, Token::Slash, Token::Percent,
-        ]);
+        assert_eq!(
+            lex("()[]{}:,. + * / %"),
+            vec![
+                Token::LParen,
+                Token::RParen,
+                Token::LBracket,
+                Token::RBracket,
+                Token::LBrace,
+                Token::RBrace,
+                Token::Colon,
+                Token::Comma,
+                Token::Dot,
+                Token::Plus,
+                Token::Star,
+                Token::Slash,
+                Token::Percent,
+            ]
+        );
     }
 
     #[test]
     fn simple_query() {
         let tokens = lex("MATCH (p:Person) RETURN p.name");
-        assert_eq!(tokens, vec![
-            Token::Match,
-            Token::LParen, Token::Ident("p".into()), Token::Colon,
-            Token::Ident("Person".into()), Token::RParen,
-            Token::Return,
-            Token::Ident("p".into()), Token::Dot, Token::Ident("name".into()),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Match,
+                Token::LParen,
+                Token::Ident("p".into()),
+                Token::Colon,
+                Token::Ident("Person".into()),
+                Token::RParen,
+                Token::Return,
+                Token::Ident("p".into()),
+                Token::Dot,
+                Token::Ident("name".into()),
+            ]
+        );
     }
 
     #[test]
     fn skips_comments() {
-        assert_eq!(lex("42 // comment\n7"), vec![Token::Integer(42), Token::Integer(7)]);
+        assert_eq!(
+            lex("42 // comment\n7"),
+            vec![Token::Integer(42), Token::Integer(7)]
+        );
     }
 
     #[test]
     fn span_positions() {
-        let toks: Vec<_> = Lexer::new("MATCH (p)")
-            .map(|r| r.unwrap())
-            .collect();
+        let toks: Vec<_> = Lexer::new("MATCH (p)").map(|r| r.unwrap()).collect();
         assert_eq!(toks[0], (0, Token::Match, 5));
         assert_eq!(toks[1], (6, Token::LParen, 7));
         assert_eq!(toks[2], (7, Token::Ident("p".into()), 8));
@@ -544,8 +581,9 @@ mod tests {
     fn integer_then_dot_ident() {
         // "42.foo" should be Integer(42), Dot, Ident("foo")
         // because the character after . is not a digit
-        assert_eq!(lex("42.foo"), vec![
-            Token::Integer(42), Token::Dot, Token::Ident("foo".into()),
-        ]);
+        assert_eq!(
+            lex("42.foo"),
+            vec![Token::Integer(42), Token::Dot, Token::Ident("foo".into()),]
+        );
     }
 }

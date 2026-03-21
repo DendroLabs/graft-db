@@ -44,7 +44,10 @@ impl std::fmt::Display for Value {
                 }
             }
             Value::Edge {
-                id, source, target, label,
+                id,
+                source,
+                target,
+                label,
             } => {
                 if let Some(l) = label {
                     write!(f, "[:{l} {{id: {id}, {source}->{target}}}]")
@@ -160,11 +163,7 @@ pub trait StorageAccess {
     fn edge_property(&self, id: EdgeId, key: &str) -> Value;
 
     // Mutations
-    fn create_node(
-        &mut self,
-        label: Option<&str>,
-        properties: &[(String, Value)],
-    ) -> NodeId;
+    fn create_node(&mut self, label: Option<&str>, properties: &[(String, Value)]) -> NodeId;
     fn create_edge(
         &mut self,
         source: NodeId,
@@ -178,7 +177,9 @@ pub trait StorageAccess {
     fn delete_edge(&mut self, id: EdgeId);
 
     // Transaction lifecycle (default no-ops for backward compatibility)
-    fn begin_tx(&mut self) -> u64 { 0 }
+    fn begin_tx(&mut self) -> u64 {
+        0
+    }
     fn commit_tx(&mut self) {}
     fn abort_tx(&mut self) {}
 }
@@ -233,10 +234,7 @@ pub fn execute(
 
     let rows = result?;
 
-    let columns = rows
-        .first()
-        .map(|r| r.columns())
-        .unwrap_or_default();
+    let columns = rows.first().map(|r| r.columns()).unwrap_or_default();
 
     let data = rows
         .iter()
@@ -258,10 +256,7 @@ pub fn execute(
 // Internal execution
 // ---------------------------------------------------------------------------
 
-fn execute_plan(
-    plan: &Plan,
-    storage: &mut dyn StorageAccess,
-) -> Result<Vec<Row>, ExecutionError> {
+fn execute_plan(plan: &Plan, storage: &mut dyn StorageAccess) -> Result<Vec<Row>, ExecutionError> {
     match plan {
         Plan::NodeScan { variable, label } => {
             let nodes = storage.scan_nodes(label.as_deref());
@@ -302,18 +297,11 @@ fn execute_plan(
                 };
 
                 let edges = match direction {
-                    EdgeDirection::Right => {
-                        storage.outbound_edges(src_id, edge_label.as_deref())
-                    }
-                    EdgeDirection::Left => {
-                        storage.inbound_edges(src_id, edge_label.as_deref())
-                    }
+                    EdgeDirection::Right => storage.outbound_edges(src_id, edge_label.as_deref()),
+                    EdgeDirection::Left => storage.inbound_edges(src_id, edge_label.as_deref()),
                     EdgeDirection::Undirected => {
-                        let mut all =
-                            storage.outbound_edges(src_id, edge_label.as_deref());
-                        all.extend(
-                            storage.inbound_edges(src_id, edge_label.as_deref()),
-                        );
+                        let mut all = storage.outbound_edges(src_id, edge_label.as_deref());
+                        all.extend(storage.inbound_edges(src_id, edge_label.as_deref()));
                         all
                     }
                 };
@@ -342,9 +330,7 @@ fn execute_plan(
                         }
                     }
 
-                    let dst_label_actual = storage
-                        .get_node(dst_id)
-                        .and_then(|n| n.label);
+                    let dst_label_actual = storage.get_node(dst_id).and_then(|n| n.label);
 
                     let mut new_row = row.clone();
                     if let Some(ref evar) = edge_var {
@@ -474,8 +460,7 @@ fn execute_plan(
                     })
                     .collect::<Result<_, ExecutionError>>()?;
 
-                let node_id =
-                    storage.create_node(label.as_deref(), &props);
+                let node_id = storage.create_node(label.as_deref(), &props);
                 let mut new_row = row;
                 if let Some(ref var) = variable {
                     new_row = new_row.bind(
@@ -529,12 +514,7 @@ fn execute_plan(
                     })
                     .collect::<Result<_, ExecutionError>>()?;
 
-                let edge_id = storage.create_edge(
-                    from_id,
-                    to_id,
-                    label.as_deref(),
-                    &props,
-                );
+                let edge_id = storage.create_edge(from_id, to_id, label.as_deref(), &props);
                 let mut new_row = row;
                 if let Some(ref var) = variable {
                     new_row = new_row.bind(
@@ -611,9 +591,7 @@ fn execute_plan(
                     AggFunction::Sum => {
                         let mut sum = 0.0f64;
                         for row in &input_rows {
-                            if let Ok(v) =
-                                eval_expr(&op.input_expr, row, storage)
-                            {
+                            if let Ok(v) = eval_expr(&op.input_expr, row, storage) {
                                 if let Some(n) = v.as_f64() {
                                     sum += n;
                                 }
@@ -625,9 +603,7 @@ fn execute_plan(
                         let mut sum = 0.0f64;
                         let mut count = 0u64;
                         for row in &input_rows {
-                            if let Ok(v) =
-                                eval_expr(&op.input_expr, row, storage)
-                            {
+                            if let Ok(v) = eval_expr(&op.input_expr, row, storage) {
                                 if let Some(n) = v.as_f64() {
                                     sum += n;
                                     count += 1;
@@ -643,13 +619,9 @@ fn execute_plan(
                     AggFunction::Min => {
                         let mut min: Option<f64> = None;
                         for row in &input_rows {
-                            if let Ok(v) =
-                                eval_expr(&op.input_expr, row, storage)
-                            {
+                            if let Ok(v) = eval_expr(&op.input_expr, row, storage) {
                                 if let Some(n) = v.as_f64() {
-                                    min = Some(
-                                        min.map_or(n, |m: f64| m.min(n)),
-                                    );
+                                    min = Some(min.map_or(n, |m: f64| m.min(n)));
                                 }
                             }
                         }
@@ -658,13 +630,9 @@ fn execute_plan(
                     AggFunction::Max => {
                         let mut max: Option<f64> = None;
                         for row in &input_rows {
-                            if let Ok(v) =
-                                eval_expr(&op.input_expr, row, storage)
-                            {
+                            if let Ok(v) = eval_expr(&op.input_expr, row, storage) {
                                 if let Some(n) = v.as_f64() {
-                                    max = Some(
-                                        max.map_or(n, |m: f64| m.max(n)),
-                                    );
+                                    max = Some(max.map_or(n, |m: f64| m.max(n)));
                                 }
                             }
                         }
@@ -741,8 +709,8 @@ fn execute_plan(
                                 storage.inbound_edges(current_id, edge_label.as_deref())
                             }
                             EdgeDirection::Undirected => {
-                                let mut all = storage
-                                    .outbound_edges(current_id, edge_label.as_deref());
+                                let mut all =
+                                    storage.outbound_edges(current_id, edge_label.as_deref());
                                 all.extend(
                                     storage.inbound_edges(current_id, edge_label.as_deref()),
                                 );
@@ -783,9 +751,7 @@ fn execute_plan(
                 let key: Vec<String> = row
                     .columns()
                     .iter()
-                    .map(|col| {
-                        format!("{}", row.get(col).cloned().unwrap_or(Value::Null))
-                    })
+                    .map(|col| format!("{}", row.get(col).cloned().unwrap_or(Value::Null)))
                     .collect();
                 if seen.insert(key) {
                     result.push(row);
@@ -801,11 +767,7 @@ fn execute_plan(
 // Expression evaluator
 // ---------------------------------------------------------------------------
 
-fn eval_expr(
-    expr: &Expr,
-    row: &Row,
-    storage: &dyn StorageAccess,
-) -> Result<Value, ExecutionError> {
+fn eval_expr(expr: &Expr, row: &Row, storage: &dyn StorageAccess) -> Result<Value, ExecutionError> {
     match expr {
         Expr::Literal(lit) => Ok(literal_to_value(lit)),
 
@@ -836,9 +798,7 @@ fn eval_expr(
             eval_unary_op(*op, v)
         }
 
-        Expr::FunctionCall { name, args } => {
-            eval_function(name, args, row, storage)
-        }
+        Expr::FunctionCall { name, args } => eval_function(name, args, row, storage),
     }
 }
 
@@ -852,20 +812,18 @@ fn literal_to_value(lit: &Literal) -> Value {
     }
 }
 
-fn eval_binary_op(
-    op: BinaryOp,
-    left: Value,
-    right: Value,
-) -> Result<Value, ExecutionError> {
+fn eval_binary_op(op: BinaryOp, left: Value, right: Value) -> Result<Value, ExecutionError> {
     // NULL propagation for most operations
     if matches!((&left, &right), (Value::Null, _) | (_, Value::Null)) {
         return match op {
-            BinaryOp::Eq => Ok(Value::Bool(
-                matches!((&left, &right), (Value::Null, Value::Null)),
-            )),
-            BinaryOp::Neq => Ok(Value::Bool(
-                !matches!((&left, &right), (Value::Null, Value::Null)),
-            )),
+            BinaryOp::Eq => Ok(Value::Bool(matches!(
+                (&left, &right),
+                (Value::Null, Value::Null)
+            ))),
+            BinaryOp::Neq => Ok(Value::Bool(!matches!(
+                (&left, &right),
+                (Value::Null, Value::Null)
+            ))),
             _ => Ok(Value::Null),
         };
     }
@@ -896,8 +854,8 @@ fn eval_binary_op(
         BinaryOp::Sub => numeric_op(&left, &right, |a, b| a - b, |a, b| a - b),
         BinaryOp::Mul => numeric_op(&left, &right, |a, b| a * b, |a, b| a * b),
         BinaryOp::Div => {
-            let is_zero = matches!(&right, Value::Int(0))
-                || matches!(&right, Value::Float(f) if *f == 0.0);
+            let is_zero =
+                matches!(&right, Value::Int(0)) || matches!(&right, Value::Float(f) if *f == 0.0);
             if is_zero {
                 Err(ExecutionError::DivisionByZero)
             } else {
@@ -947,9 +905,7 @@ fn eval_unary_op(op: UnaryOp, val: Value) -> Result<Value, ExecutionError> {
             Value::Int(n) => Ok(Value::Int(-n)),
             Value::Float(f) => Ok(Value::Float(-f)),
             Value::Null => Ok(Value::Null),
-            _ => Err(ExecutionError::TypeError(format!(
-                "cannot negate {val}"
-            ))),
+            _ => Err(ExecutionError::TypeError(format!("cannot negate {val}"))),
         },
         UnaryOp::IsNull => Ok(Value::Bool(matches!(val, Value::Null))),
         UnaryOp::IsNotNull => Ok(Value::Bool(!matches!(val, Value::Null))),
@@ -964,9 +920,9 @@ fn eval_function(
 ) -> Result<Value, ExecutionError> {
     match name.to_ascii_uppercase().as_str() {
         "ID" => {
-            let arg = args.first().ok_or_else(|| {
-                ExecutionError::TypeError("id() requires one argument".into())
-            })?;
+            let arg = args
+                .first()
+                .ok_or_else(|| ExecutionError::TypeError("id() requires one argument".into()))?;
             let val = eval_expr(arg, row, storage)?;
             match val {
                 Value::Node { id, .. } => Ok(Value::Int(id.as_u64() as i64)),
@@ -977,17 +933,13 @@ fn eval_function(
             }
         }
         "TYPE" => {
-            let arg = args.first().ok_or_else(|| {
-                ExecutionError::TypeError("type() requires one argument".into())
-            })?;
+            let arg = args
+                .first()
+                .ok_or_else(|| ExecutionError::TypeError("type() requires one argument".into()))?;
             let val = eval_expr(arg, row, storage)?;
             match val {
-                Value::Edge { label, .. } => Ok(label
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)),
-                _ => Err(ExecutionError::TypeError(
-                    "type() requires an edge".into(),
-                )),
+                Value::Edge { label, .. } => Ok(label.map(Value::String).unwrap_or(Value::Null)),
+                _ => Err(ExecutionError::TypeError("type() requires an edge".into())),
             }
         }
         "LABELS" => {
@@ -996,12 +948,8 @@ fn eval_function(
             })?;
             let val = eval_expr(arg, row, storage)?;
             match val {
-                Value::Node { label, .. } => Ok(label
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)),
-                _ => Err(ExecutionError::TypeError(
-                    "labels() requires a node".into(),
-                )),
+                Value::Node { label, .. } => Ok(label.map(Value::String).unwrap_or(Value::Null)),
+                _ => Err(ExecutionError::TypeError("labels() requires a node".into())),
             }
         }
         "TOSTRING" => {
@@ -1019,14 +967,9 @@ fn eval_function(
             match val {
                 Value::Int(_) => Ok(val),
                 Value::Float(f) => Ok(Value::Int(f as i64)),
-                Value::String(ref s) => s
-                    .parse::<i64>()
-                    .map(Value::Int)
-                    .map_err(|_| {
-                        ExecutionError::TypeError(format!(
-                            "cannot convert '{s}' to integer"
-                        ))
-                    }),
+                Value::String(ref s) => s.parse::<i64>().map(Value::Int).map_err(|_| {
+                    ExecutionError::TypeError(format!("cannot convert '{s}' to integer"))
+                }),
                 Value::Bool(b) => Ok(Value::Int(if b { 1 } else { 0 })),
                 Value::Null => Ok(Value::Null),
                 _ => Err(ExecutionError::TypeError(format!(
@@ -1042,14 +985,9 @@ fn eval_function(
             match val {
                 Value::Float(_) => Ok(val),
                 Value::Int(n) => Ok(Value::Float(n as f64)),
-                Value::String(ref s) => s
-                    .parse::<f64>()
-                    .map(Value::Float)
-                    .map_err(|_| {
-                        ExecutionError::TypeError(format!(
-                            "cannot convert '{s}' to float"
-                        ))
-                    }),
+                Value::String(ref s) => s.parse::<f64>().map(Value::Float).map_err(|_| {
+                    ExecutionError::TypeError(format!("cannot convert '{s}' to float"))
+                }),
                 Value::Null => Ok(Value::Null),
                 _ => Err(ExecutionError::TypeError(format!(
                     "cannot convert {val} to float"
@@ -1095,12 +1033,8 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (Value::Int(a), Value::Float(b)) => {
-            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float(a), Value::Int(b)) => {
-            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
-        }
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Null, Value::Null) => Ordering::Equal,
@@ -1152,11 +1086,7 @@ mod tests {
             }
         }
 
-        fn add_node(
-            &mut self,
-            label: Option<&str>,
-            props: &[(&str, Value)],
-        ) -> NodeId {
+        fn add_node(&mut self, label: Option<&str>, props: &[(&str, Value)]) -> NodeId {
             let id = NodeId::from_raw(self.next_node_id);
             self.next_node_id += 1;
             let mut properties = HashMap::new();
@@ -1199,9 +1129,7 @@ mod tests {
         fn scan_nodes(&self, label: Option<&str>) -> Vec<NodeInfo> {
             self.nodes
                 .iter()
-                .filter(|n| {
-                    label.map_or(true, |l| n.label.as_deref() == Some(l))
-                })
+                .filter(|n| label.map_or(true, |l| n.label.as_deref() == Some(l)))
                 .map(|n| NodeInfo {
                     id: n.id,
                     label: n.label.clone(),
@@ -1210,13 +1138,10 @@ mod tests {
         }
 
         fn get_node(&self, id: NodeId) -> Option<NodeInfo> {
-            self.nodes
-                .iter()
-                .find(|n| n.id == id)
-                .map(|n| NodeInfo {
-                    id: n.id,
-                    label: n.label.clone(),
-                })
+            self.nodes.iter().find(|n| n.id == id).map(|n| NodeInfo {
+                id: n.id,
+                label: n.label.clone(),
+            })
         }
 
         fn node_property(&self, id: NodeId, key: &str) -> Value {
@@ -1228,16 +1153,11 @@ mod tests {
                 .unwrap_or(Value::Null)
         }
 
-        fn outbound_edges(
-            &self,
-            node_id: NodeId,
-            label: Option<&str>,
-        ) -> Vec<EdgeInfo> {
+        fn outbound_edges(&self, node_id: NodeId, label: Option<&str>) -> Vec<EdgeInfo> {
             self.edges
                 .iter()
                 .filter(|e| {
-                    e.source == node_id
-                        && label.map_or(true, |l| e.label.as_deref() == Some(l))
+                    e.source == node_id && label.map_or(true, |l| e.label.as_deref() == Some(l))
                 })
                 .map(|e| EdgeInfo {
                     id: e.id,
@@ -1248,16 +1168,11 @@ mod tests {
                 .collect()
         }
 
-        fn inbound_edges(
-            &self,
-            node_id: NodeId,
-            label: Option<&str>,
-        ) -> Vec<EdgeInfo> {
+        fn inbound_edges(&self, node_id: NodeId, label: Option<&str>) -> Vec<EdgeInfo> {
             self.edges
                 .iter()
                 .filter(|e| {
-                    e.target == node_id
-                        && label.map_or(true, |l| e.label.as_deref() == Some(l))
+                    e.target == node_id && label.map_or(true, |l| e.label.as_deref() == Some(l))
                 })
                 .map(|e| EdgeInfo {
                     id: e.id,
@@ -1277,11 +1192,7 @@ mod tests {
                 .unwrap_or(Value::Null)
         }
 
-        fn create_node(
-            &mut self,
-            label: Option<&str>,
-            properties: &[(String, Value)],
-        ) -> NodeId {
+        fn create_node(&mut self, label: Option<&str>, properties: &[(String, Value)]) -> NodeId {
             let id = NodeId::from_raw(self.next_node_id);
             self.next_node_id += 1;
             let mut props = HashMap::new();
@@ -1343,13 +1254,9 @@ mod tests {
 
     // -- Helper to run a query against a storage ----------------------------
 
-    fn run(
-        query: &str,
-        storage: &mut MemoryStorage,
-    ) -> Result<QueryResult, String> {
+    fn run(query: &str, storage: &mut MemoryStorage) -> Result<QueryResult, String> {
         let stmt = crate::parse(query).map_err(|e| e)?;
-        let plan =
-            crate::planner::plan(&stmt).map_err(|e| e.to_string())?;
+        let plan = crate::planner::plan(&stmt).map_err(|e| e.to_string())?;
         execute(&plan, storage).map_err(|e| e.to_string())
     }
 
@@ -1357,18 +1264,32 @@ mod tests {
         let mut s = MemoryStorage::new();
         let alice = s.add_node(
             Some("Person"),
-            &[("name", Value::String("Alice".into())), ("age", Value::Int(30))],
+            &[
+                ("name", Value::String("Alice".into())),
+                ("age", Value::Int(30)),
+            ],
         );
         let bob = s.add_node(
             Some("Person"),
-            &[("name", Value::String("Bob".into())), ("age", Value::Int(25))],
+            &[
+                ("name", Value::String("Bob".into())),
+                ("age", Value::Int(25)),
+            ],
         );
         let charlie = s.add_node(
             Some("Person"),
-            &[("name", Value::String("Charlie".into())), ("age", Value::Int(35))],
+            &[
+                ("name", Value::String("Charlie".into())),
+                ("age", Value::Int(35)),
+            ],
         );
         s.add_edge(alice, bob, Some("KNOWS"), &[("since", Value::Int(2020))]);
-        s.add_edge(alice, charlie, Some("KNOWS"), &[("since", Value::Int(2019))]);
+        s.add_edge(
+            alice,
+            charlie,
+            Some("KNOWS"),
+            &[("since", Value::Int(2019))],
+        );
         s.add_edge(bob, charlie, Some("KNOWS"), &[("since", Value::Int(2021))]);
         s
     }
@@ -1386,22 +1307,14 @@ mod tests {
     #[test]
     fn filter_by_age() {
         let mut s = setup_social_graph();
-        let result = run(
-            "MATCH (p:Person) WHERE p.age > 28 RETURN p.name",
-            &mut s,
-        )
-        .unwrap();
+        let result = run("MATCH (p:Person) WHERE p.age > 28 RETURN p.name", &mut s).unwrap();
         assert_eq!(result.rows.len(), 2); // Alice(30) and Charlie(35)
     }
 
     #[test]
     fn filter_by_property_pattern() {
         let mut s = setup_social_graph();
-        let result = run(
-            "MATCH (p:Person {name: 'Alice'}) RETURN p.age",
-            &mut s,
-        )
-        .unwrap();
+        let result = run("MATCH (p:Person {name: 'Alice'}) RETURN p.age", &mut s).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert!(matches!(&result.rows[0][0], Value::Int(30)));
     }
@@ -1420,11 +1333,7 @@ mod tests {
     #[test]
     fn order_by() {
         let mut s = setup_social_graph();
-        let result = run(
-            "MATCH (p:Person) RETURN p.name ORDER BY p.age DESC",
-            &mut s,
-        )
-        .unwrap();
+        let result = run("MATCH (p:Person) RETURN p.name ORDER BY p.age DESC", &mut s).unwrap();
         assert_eq!(result.rows.len(), 3);
         assert!(matches!(&result.rows[0][0], Value::String(s) if s == "Charlie"));
         assert!(matches!(&result.rows[1][0], Value::String(s) if s == "Alice"));
@@ -1452,8 +1361,7 @@ mod tests {
     #[test]
     fn aggregate_count() {
         let mut s = setup_social_graph();
-        let result =
-            run("MATCH (p:Person) RETURN COUNT(p)", &mut s).unwrap();
+        let result = run("MATCH (p:Person) RETURN COUNT(p)", &mut s).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert!(matches!(&result.rows[0][0], Value::Int(3)));
     }
@@ -1461,8 +1369,7 @@ mod tests {
     #[test]
     fn aggregate_avg() {
         let mut s = setup_social_graph();
-        let result =
-            run("MATCH (p:Person) RETURN AVG(p.age)", &mut s).unwrap();
+        let result = run("MATCH (p:Person) RETURN AVG(p.age)", &mut s).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert!(matches!(&result.rows[0][0], Value::Float(f) if (*f - 30.0).abs() < 0.01));
     }
@@ -1502,14 +1409,13 @@ mod tests {
         let mut s = MemoryStorage::new();
         s.add_node(
             Some("Person"),
-            &[("name", Value::String("Alice".into())), ("age", Value::Int(30))],
+            &[
+                ("name", Value::String("Alice".into())),
+                ("age", Value::Int(30)),
+            ],
         );
 
-        run(
-            "MATCH (p:Person {name: 'Alice'}) SET p.age = 31",
-            &mut s,
-        )
-        .unwrap();
+        run("MATCH (p:Person {name: 'Alice'}) SET p.age = 31", &mut s).unwrap();
 
         assert!(matches!(
             s.nodes[0].properties.get("age"),
@@ -1520,21 +1426,11 @@ mod tests {
     #[test]
     fn delete_node() {
         let mut s = MemoryStorage::new();
-        s.add_node(
-            Some("Person"),
-            &[("name", Value::String("Alice".into()))],
-        );
-        s.add_node(
-            Some("Person"),
-            &[("name", Value::String("Bob".into()))],
-        );
+        s.add_node(Some("Person"), &[("name", Value::String("Alice".into()))]);
+        s.add_node(Some("Person"), &[("name", Value::String("Bob".into()))]);
         assert_eq!(s.nodes.len(), 2);
 
-        run(
-            "MATCH (p:Person {name: 'Alice'}) DELETE p",
-            &mut s,
-        )
-        .unwrap();
+        run("MATCH (p:Person {name: 'Alice'}) DELETE p", &mut s).unwrap();
 
         assert_eq!(s.nodes.len(), 1);
         assert_eq!(
@@ -1546,11 +1442,7 @@ mod tests {
     #[test]
     fn expression_arithmetic() {
         let mut s = setup_social_graph();
-        let result = run(
-            "MATCH (p:Person {name: 'Alice'}) RETURN p.age + 10",
-            &mut s,
-        )
-        .unwrap();
+        let result = run("MATCH (p:Person {name: 'Alice'}) RETURN p.age + 10", &mut s).unwrap();
         assert!(matches!(&result.rows[0][0], Value::Int(40)));
     }
 

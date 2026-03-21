@@ -1,28 +1,44 @@
-use graft_core::ShardId;
+use std::thread;
 
+use graft_core::ShardId;
+use graft_query::executor::StorageAccess;
+use graft_repl::{ReplicationReceiver, ReplicationSender};
+
+use crate::cluster::{Request, Response};
 use crate::message::ShardMessage;
 use crate::shard::Shard;
 use crate::spsc::{Consumer, Producer};
 
+const SPIN_LIMIT: u32 = 64;
+
 /// Per-shard event loop context.
 ///
 /// Each shard runs a cooperative event loop on its pinned OS thread:
-///   1. poll_io     — check for completed I/O operations
-///   2. poll_messages — drain inbound messages from other shards
-///   3. advance_queries — make progress on active queries
-///   4. submit_io   — enqueue new I/O operations
-///
-/// This is the skeleton that will integrate with IoBackend in a future phase.
+///   1. poll_coordinator — drain coordinator requests, produce responses
+///   2. poll_io          — check for completed I/O operations
+///   3. poll_messages    — drain inbound messages from other shards
+///   4. advance_queries  — make progress on active queries
+///   5. submit_io        — enqueue new I/O operations
 pub struct ShardEventLoop {
     pub shard: Shard,
     /// One consumer per other shard (messages arriving here).
     inbound: Vec<(ShardId, Consumer<ShardMessage>)>,
     /// One producer per other shard (messages going out).
     outbound: Vec<(ShardId, Producer<ShardMessage>)>,
+    /// Coordinator channel — requests from the ShardCluster coordinator.
+    coordinator_rx: Option<Consumer<Request>>,
+    /// Coordinator channel — responses back to the ShardCluster coordinator.
+    coordinator_tx: Option<Producer<Response>>,
+    /// Set to true when a Shutdown request is received.
+    should_shutdown: bool,
     /// Statistics
     messages_received: u64,
     messages_sent: u64,
     ticks: u64,
+    /// Replication sender (primary mode) — ships committed WAL records to replicas.
+    repl_sender: Option<ReplicationSender>,
+    /// Replication receiver (replica mode) — receives and applies WAL records from primary.
+    repl_receiver: Option<ReplicationReceiver>,
 }
 
 impl ShardEventLoop {
@@ -35,10 +51,67 @@ impl ShardEventLoop {
             shard,
             inbound,
             outbound,
+            coordinator_rx: None,
+            coordinator_tx: None,
+            should_shutdown: false,
             messages_received: 0,
             messages_sent: 0,
             ticks: 0,
+            repl_sender: None,
+            repl_receiver: None,
         }
+    }
+
+    /// Create an event loop with coordinator channels for use in ShardCluster.
+    pub(crate) fn with_coordinator(
+        shard: Shard,
+        coordinator_rx: Consumer<Request>,
+        coordinator_tx: Producer<Response>,
+    ) -> Self {
+        Self {
+            shard,
+            inbound: Vec::new(),
+            outbound: Vec::new(),
+            coordinator_rx: Some(coordinator_rx),
+            coordinator_tx: Some(coordinator_tx),
+            should_shutdown: false,
+            messages_received: 0,
+            messages_sent: 0,
+            ticks: 0,
+            repl_sender: None,
+            repl_receiver: None,
+        }
+    }
+
+    /// Set the replication sender (primary mode).
+    pub fn set_repl_sender(&mut self, sender: ReplicationSender) {
+        self.repl_sender = Some(sender);
+    }
+
+    /// Set the replication receiver (replica mode).
+    pub fn set_repl_receiver(&mut self, receiver: ReplicationReceiver) {
+        self.shard.set_read_only(true);
+        self.repl_receiver = Some(receiver);
+    }
+
+    /// Access the replication sender (if in primary mode).
+    pub fn repl_sender(&self) -> Option<&ReplicationSender> {
+        self.repl_sender.as_ref()
+    }
+
+    /// Mutable access to the replication sender.
+    pub fn repl_sender_mut(&mut self) -> Option<&mut ReplicationSender> {
+        self.repl_sender.as_mut()
+    }
+
+    /// Access the replication receiver (if in replica mode).
+    pub fn repl_receiver(&self) -> Option<&ReplicationReceiver> {
+        self.repl_receiver.as_ref()
+    }
+
+    /// Mutable access to the replication receiver.
+    pub fn repl_receiver_mut(&mut self) -> Option<&mut ReplicationReceiver> {
+        self.repl_receiver.as_mut()
     }
 
     pub fn shard_id(&self) -> ShardId {
@@ -57,24 +130,204 @@ impl ShardEventLoop {
         self.messages_sent
     }
 
-    /// Run one tick of the event loop. Returns the number of messages processed.
+    /// Run the event loop until shutdown. Used when the event loop is
+    /// spawned as a ShardCluster worker thread.
+    pub(crate) fn run(mut self) {
+        let mut idle_count: u32 = 0;
+        loop {
+            let work = self.tick();
+            if self.should_shutdown {
+                return;
+            }
+            if work > 0 {
+                idle_count = 0;
+            } else {
+                idle_count += 1;
+                if idle_count > SPIN_LIMIT {
+                    thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Run one tick of the event loop. Returns the number of items processed.
     pub fn tick(&mut self) -> usize {
         self.ticks += 1;
         let mut work_done = 0;
 
-        // Phase 1: poll_io (placeholder for io_uring/posix integration)
+        // Phase 1: poll_coordinator
+        work_done += self.poll_coordinator();
+
+        // Phase 2: poll_io (placeholder for io_uring/posix integration)
         // self.poll_io();
 
-        // Phase 2: poll_messages
+        // Phase 3: poll_messages
         work_done += self.poll_messages();
 
-        // Phase 3: advance_queries (placeholder for query state machines)
+        // Phase 4: advance_queries (placeholder for query state machines)
         // self.advance_queries();
 
-        // Phase 4: submit_io (placeholder)
+        // Phase 5: poll_replication
+        work_done += self.poll_replication();
+
+        // Phase 6: submit_io (placeholder)
         // self.submit_io();
 
         work_done
+    }
+
+    /// Poll replication: on primary, check for committed WAL records to ship;
+    /// on replica, apply received records to the shard.
+    fn poll_replication(&mut self) -> usize {
+        let mut work = 0;
+
+        // Primary: poll sender for outbound batches
+        if let Some(ref mut sender) = self.repl_sender {
+            sender.poll();
+            let batches = sender.drain_outbound();
+            work += batches.len();
+            // Batches are available for the network layer to send.
+            // In Phase 8b, these will be written to TCP streams.
+            // For now, they are produced and dropped (network not yet wired).
+            let _ = batches;
+        }
+
+        // Replica: apply pending records from receiver
+        if let Some(ref mut receiver) = self.repl_receiver {
+            let records = receiver.drain_records();
+            work += records.len();
+            for record in &records {
+                self.shard.apply_wal_record(record);
+            }
+        }
+
+        work
+    }
+
+    /// Drain coordinator requests and produce responses.
+    fn poll_coordinator(&mut self) -> usize {
+        if self.coordinator_rx.is_none() {
+            return 0;
+        }
+
+        // Drain all requests first to release the borrow on self
+        let mut batch = Vec::new();
+        while let Some(req) = self.coordinator_rx.as_ref().unwrap().pop() {
+            batch.push(req);
+        }
+
+        let count = batch.len();
+        for req in batch {
+            if matches!(req, Request::Shutdown) {
+                let _ = self.shard.flush();
+                self.should_shutdown = true;
+                self.send_response(Response::Done);
+                return count;
+            }
+            let resp = self.handle_request(req);
+            self.send_response(resp);
+        }
+        count
+    }
+
+    fn send_response(&self, resp: Response) {
+        if let Some(ref tx) = self.coordinator_tx {
+            let mut r = resp;
+            loop {
+                match tx.push(r) {
+                    Ok(()) => break,
+                    Err(returned) => {
+                        r = returned;
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_request(&mut self, req: Request) -> Response {
+        match req {
+            Request::Flush => {
+                let _ = self.shard.flush();
+                Response::Done
+            }
+            Request::ScanNodes { label } => {
+                Response::Nodes(self.shard.scan_nodes(label.as_deref()))
+            }
+            Request::GetNode { node_id } => Response::Node(self.shard.get_node(node_id)),
+            Request::NodeProperty { node_id, key } => {
+                Response::Value(self.shard.node_property(node_id, &key))
+            }
+            Request::OutboundEdges { node_id, label } => {
+                Response::Edges(self.shard.outbound_edges(node_id, label.as_deref()))
+            }
+            Request::InboundEdges { node_id, label } => {
+                Response::Edges(self.shard.inbound_edges(node_id, label.as_deref()))
+            }
+            Request::EdgeProperty { edge_id, key } => {
+                Response::Value(self.shard.edge_property(edge_id, &key))
+            }
+            Request::CreateNode { label, properties } => {
+                let id = self.shard.create_node(label.as_deref(), &properties);
+                Response::NodeId(id)
+            }
+            Request::CreateEdge {
+                source,
+                target,
+                label,
+                properties,
+            } => {
+                let id = self
+                    .shard
+                    .create_edge(source, target, label.as_deref(), &properties);
+                Response::EdgeId(id)
+            }
+            Request::SetNodeProperty {
+                node_id,
+                key,
+                value,
+            } => {
+                self.shard.set_node_property(node_id, &key, &value);
+                Response::Done
+            }
+            Request::SetEdgeProperty {
+                edge_id,
+                key,
+                value,
+            } => {
+                self.shard.set_edge_property(edge_id, &key, &value);
+                Response::Done
+            }
+            Request::DeleteNode { node_id } => {
+                self.shard.delete_node(node_id);
+                Response::Done
+            }
+            Request::DeleteEdge { edge_id } => {
+                self.shard.delete_edge(edge_id);
+                Response::Done
+            }
+            Request::BeginTx { tx_id } => {
+                self.shard.begin_tx_with_id(tx_id);
+                Response::Done
+            }
+            Request::SetActiveTx { tx_id } => {
+                self.shard.set_active_tx(tx_id);
+                Response::Done
+            }
+            Request::CommitTx { tx_id } => {
+                self.shard.set_active_tx(tx_id);
+                self.shard.commit_current_tx();
+                Response::Done
+            }
+            Request::AbortTx { tx_id } => {
+                self.shard.set_active_tx(tx_id);
+                self.shard.abort_current_tx();
+                Response::Done
+            }
+            Request::Shutdown => unreachable!("handled in poll_coordinator"),
+        }
     }
 
     /// Drain all inbound message queues and handle each message.
@@ -96,8 +349,6 @@ impl ShardEventLoop {
 
     /// Handle a single inbound message.
     fn handle_message(&mut self, msg: ShardMessage) {
-        use graft_query::executor::StorageAccess;
-
         match msg {
             ShardMessage::ScanNodes {
                 request_id,
@@ -116,10 +367,7 @@ impl ShardEventLoop {
                 node_id,
             } => {
                 let node = self.shard.get_node(node_id);
-                self.send_to(
-                    reply_to,
-                    ShardMessage::GetNodeResult { request_id, node },
-                );
+                self.send_to(reply_to, ShardMessage::GetNodeResult { request_id, node });
             }
             ShardMessage::GetNodeProperty {
                 request_id,
@@ -140,10 +388,7 @@ impl ShardEventLoop {
                 label,
             } => {
                 let edges = self.shard.outbound_edges(node_id, label.as_deref());
-                self.send_to(
-                    reply_to,
-                    ShardMessage::EdgesResult { request_id, edges },
-                );
+                self.send_to(reply_to, ShardMessage::EdgesResult { request_id, edges });
             }
             ShardMessage::GetInboundEdges {
                 request_id,
@@ -152,10 +397,7 @@ impl ShardEventLoop {
                 label,
             } => {
                 let edges = self.shard.inbound_edges(node_id, label.as_deref());
-                self.send_to(
-                    reply_to,
-                    ShardMessage::EdgesResult { request_id, edges },
-                );
+                self.send_to(reply_to, ShardMessage::EdgesResult { request_id, edges });
             }
             // Responses are collected by whoever is waiting
             ShardMessage::ScanNodesResult { .. }
@@ -263,9 +505,10 @@ mod tests {
         let mut loops = build_shard_mesh(2, 64);
 
         // Add data to shard 0
-        loops[0]
-            .shard
-            .create_node(Some("Person"), &[("name".into(), Value::String("Alice".into()))]);
+        loops[0].shard.create_node(
+            Some("Person"),
+            &[("name".into(), Value::String("Alice".into()))],
+        );
 
         // Shard 1 requests a scan from shard 0
         // We manually push a message from shard 1's outbound to shard 0's inbound
@@ -298,6 +541,147 @@ mod tests {
         assert_eq!(loops[0].tick(), 0);
         assert_eq!(loops[0].ticks(), 2);
         assert_eq!(loops[0].messages_received(), 0);
+    }
+
+    #[test]
+    fn event_loop_handles_coordinator_requests() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+
+        let shard = Shard::new(0);
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+
+        // Create a node via coordinator request
+        req_tx
+            .push(Request::CreateNode {
+                label: Some("Person".into()),
+                properties: vec![("name".into(), Value::String("Alice".into()))],
+            })
+            .unwrap();
+
+        let work = el.tick();
+        assert_eq!(work, 1);
+
+        // Should have a NodeId response
+        let resp = resp_rx.pop().unwrap();
+        match resp {
+            Response::NodeId(id) => assert_eq!(id.shard(), 0),
+            other => panic!("expected NodeId, got {:?}", other),
+        }
+
+        // Scan nodes via coordinator
+        req_tx
+            .push(Request::ScanNodes { label: None })
+            .unwrap();
+        el.tick();
+        let resp = resp_rx.pop().unwrap();
+        match resp {
+            Response::Nodes(nodes) => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].label.as_deref(), Some("Person"));
+            }
+            other => panic!("expected Nodes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_loop_coordinator_tx_lifecycle() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+
+        let shard = Shard::new(0);
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+
+        // Begin tx
+        req_tx.push(Request::BeginTx { tx_id: 1 }).unwrap();
+        el.tick();
+        assert!(matches!(resp_rx.pop().unwrap(), Response::Done));
+
+        // Create node in tx
+        req_tx
+            .push(Request::CreateNode {
+                label: Some("N".into()),
+                properties: vec![],
+            })
+            .unwrap();
+        el.tick();
+        let _node_id = match resp_rx.pop().unwrap() {
+            Response::NodeId(id) => id,
+            other => panic!("expected NodeId, got {:?}", other),
+        };
+
+        // Commit
+        req_tx.push(Request::CommitTx { tx_id: 1 }).unwrap();
+        el.tick();
+        assert!(matches!(resp_rx.pop().unwrap(), Response::Done));
+
+        // Verify node visible after commit
+        req_tx
+            .push(Request::BeginTx { tx_id: 2 })
+            .unwrap();
+        el.tick();
+        resp_rx.pop(); // consume Done
+
+        req_tx.push(Request::ScanNodes { label: None }).unwrap();
+        el.tick();
+        match resp_rx.pop().unwrap() {
+            Response::Nodes(nodes) => assert_eq!(nodes.len(), 1),
+            other => panic!("expected Nodes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_loop_shutdown() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+
+        let shard = Shard::new(0);
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+
+        req_tx.push(Request::Shutdown).unwrap();
+        el.tick();
+
+        assert!(el.should_shutdown);
+        // Should have sent a Done response
+        assert!(matches!(resp_rx.pop().unwrap(), Response::Done));
+    }
+
+    #[test]
+    fn event_loop_mixed_coordinator_and_mesh() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+
+        // Create a single-shard event loop with both coordinator and mesh channels
+        let shard = Shard::new(0);
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+
+        // Coordinator request
+        req_tx
+            .push(Request::CreateNode {
+                label: Some("N".into()),
+                properties: vec![("v".into(), Value::Int(42))],
+            })
+            .unwrap();
+
+        let work = el.tick();
+        assert_eq!(work, 1);
+        assert!(matches!(resp_rx.pop().unwrap(), Response::NodeId(_)));
+
+        // No work on idle tick
+        let work = el.tick();
+        assert_eq!(work, 0);
     }
 
     #[test]

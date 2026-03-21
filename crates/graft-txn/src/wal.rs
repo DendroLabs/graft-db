@@ -39,7 +39,7 @@ pub enum WalRecordType {
 }
 
 impl WalRecordType {
-    fn from_u8(v: u8) -> Option<Self> {
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::Begin),
             2 => Some(Self::Commit),
@@ -82,15 +82,15 @@ pub enum WalBody {
 }
 
 impl WalBody {
-    fn serialized_len(&self) -> usize {
+    pub fn serialized_len(&self) -> usize {
         match self {
             Self::Empty => 0,
             Self::PageWrite { .. } => 8 + 2 + 6 + RECORD_SIZE, // 80
-            Self::PageClear { .. } => 8 + 2 + 6, // 16
+            Self::PageClear { .. } => 8 + 2 + 6,               // 16
         }
     }
 
-    fn write_to(&self, buf: &mut Vec<u8>) {
+    pub fn write_to(&self, buf: &mut Vec<u8>) {
         match self {
             Self::Empty => {}
             Self::PageWrite {
@@ -118,7 +118,7 @@ impl WalBody {
         }
     }
 
-    fn read_from(record_type: WalRecordType, data: &[u8]) -> Option<Self> {
+    pub fn read_from(record_type: WalRecordType, data: &[u8]) -> Option<Self> {
         match record_type {
             WalRecordType::Begin
             | WalRecordType::Commit
@@ -197,12 +197,7 @@ impl WalWriter {
 
     /// Append a WAL record to the buffer. Returns the record's LSN (byte
     /// offset in the WAL file).
-    pub fn append(
-        &mut self,
-        tx_id: TxId,
-        record_type: WalRecordType,
-        body: &WalBody,
-    ) -> u64 {
+    pub fn append(&mut self, tx_id: TxId, record_type: WalRecordType, body: &WalBody) -> u64 {
         let lsn = self.file_offset + self.buffer.len() as u64;
         let body_len = body.serialized_len() as u32;
 
@@ -321,7 +316,11 @@ impl WalReader {
         // Read body + crc
         let mut payload = vec![0u8; body_len + WAL_CRC_SIZE];
         if io
-            .read_at(self.handle, self.offset + WAL_HEADER_SIZE as u64, &mut payload)
+            .read_at(
+                self.handle,
+                self.offset + WAL_HEADER_SIZE as u64,
+                &mut payload,
+            )
             .ok()?
             < payload.len()
         {
@@ -329,8 +328,7 @@ impl WalReader {
         }
 
         // Verify CRC
-        let stored_crc =
-            u32::from_le_bytes(payload[body_len..body_len + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(payload[body_len..body_len + 4].try_into().unwrap());
         let mut computed = crc32c::crc32c(&header);
         computed = crc32c::crc32c_append(computed, &payload[..body_len]);
         if stored_crc != computed {

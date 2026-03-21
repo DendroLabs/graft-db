@@ -113,23 +113,18 @@ impl TransactionManager {
         wal: Option<&mut WalWriter>,
         io: Option<&mut dyn IoBackend>,
     ) -> Result<()> {
-        let tx = self
-            .active
-            .get(&tx_id)
-            .ok_or(Error::TxNotActive)?;
+        let tx = self.active.get(&tx_id).ok_or(Error::TxNotActive)?;
 
         // First-committer-wins: check if any of our writes conflict with
         // a transaction that committed concurrently (i.e. was not visible
         // to our snapshot).
         for &(page_id, slot) in &tx.write_set {
             if let Some(&last_writer) = self.committed_writes.get(&(page_id, slot)) {
-                let was_invisible = last_writer >= tx.snapshot.ts
-                    || tx.snapshot.active.contains(&last_writer);
+                let was_invisible =
+                    last_writer >= tx.snapshot.ts || tx.snapshot.active.contains(&last_writer);
                 if was_invisible {
                     self.abort(tx_id, wal);
-                    return Err(Error::WriteConflict(
-                        graft_core::NodeId::from_raw(page_id),
-                    ));
+                    return Err(Error::WriteConflict(graft_core::NodeId::from_raw(page_id)));
                 }
             }
         }
@@ -194,6 +189,15 @@ impl TransactionManager {
         self.next_tx_id
     }
 
+    /// Mark a transaction as committed without running conflict detection.
+    /// Used by replication receivers applying records from the primary.
+    pub fn mark_committed(&mut self, tx_id: TxId) {
+        self.committed_set.insert(tx_id);
+        if tx_id >= self.next_tx_id {
+            self.next_tx_id = tx_id + 1;
+        }
+    }
+
     /// Advance the next_tx_id if `id` is >= current next. Used after
     /// recovery to ensure new transactions don't collide with old ones.
     /// Also updates base_tx_id so records from previous sessions are
@@ -222,7 +226,8 @@ impl TransactionManager {
 
         if new_low > self.low_water {
             // Prune committed_writes below the low-water mark (conflict detection only)
-            self.committed_writes.retain(|_, &mut tx| tx >= self.low_water);
+            self.committed_writes
+                .retain(|_, &mut tx| tx >= self.low_water);
             // Note: committed_set is NOT pruned — it's needed for MVCC
             // visibility checks (was_committed). A future optimization can
             // replace it with a high-water mark once all txs below it are

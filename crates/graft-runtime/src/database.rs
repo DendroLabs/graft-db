@@ -43,8 +43,7 @@ impl Database {
     pub fn query(&mut self, gql: &str) -> Result<QueryResult, String> {
         let ast = graft_query::parse(gql)?;
         let plan = graft_query::planner::plan(&ast).map_err(|e| format!("{e}"))?;
-        graft_query::executor::execute(&plan, self)
-            .map_err(|e| format!("{e}"))
+        graft_query::executor::execute(&plan, self).map_err(|e| format!("{e}"))
     }
 
     /// Pick the next shard for new node creation (round-robin).
@@ -124,11 +123,7 @@ impl StorageAccess for Database {
         self.shard_for_edge(id).edge_property(id, key)
     }
 
-    fn create_node(
-        &mut self,
-        label: Option<&str>,
-        properties: &[(String, Value)],
-    ) -> NodeId {
+    fn create_node(&mut self, label: Option<&str>, properties: &[(String, Value)]) -> NodeId {
         let shard_id = self.pick_shard();
         let idx = shard_id as usize;
         self.shards[idx].create_node(label, properties)
@@ -147,11 +142,13 @@ impl StorageAccess for Database {
     }
 
     fn set_node_property(&mut self, id: NodeId, key: &str, value: &Value) {
-        self.shard_for_node_mut(id).set_node_property(id, key, value);
+        self.shard_for_node_mut(id)
+            .set_node_property(id, key, value);
     }
 
     fn set_edge_property(&mut self, id: EdgeId, key: &str, value: &Value) {
-        self.shard_for_edge_mut(id).set_edge_property(id, key, value);
+        self.shard_for_edge_mut(id)
+            .set_edge_property(id, key, value);
     }
 
     fn delete_node(&mut self, id: NodeId) {
@@ -195,10 +192,14 @@ mod tests {
     #[test]
     fn create_and_match() {
         let mut db = Database::new();
-        db.query("CREATE (a:Person {name: 'Alice', age: 30})").unwrap();
-        db.query("CREATE (b:Person {name: 'Bob', age: 25})").unwrap();
+        db.query("CREATE (a:Person {name: 'Alice', age: 30})")
+            .unwrap();
+        db.query("CREATE (b:Person {name: 'Bob', age: 25})")
+            .unwrap();
 
-        let result = db.query("MATCH (p:Person) RETURN p.name ORDER BY p.name").unwrap();
+        let result = db
+            .query("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+            .unwrap();
         assert_eq!(result.columns, vec!["p.name"]);
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::String("Alice".into()));
@@ -231,11 +232,15 @@ mod tests {
     #[test]
     fn where_filter() {
         let mut db = Database::new();
-        db.query("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
+        db.query("CREATE (:Person {name: 'Alice', age: 30})")
+            .unwrap();
         db.query("CREATE (:Person {name: 'Bob', age: 25})").unwrap();
-        db.query("CREATE (:Person {name: 'Charlie', age: 35})").unwrap();
+        db.query("CREATE (:Person {name: 'Charlie', age: 35})")
+            .unwrap();
 
-        let result = db.query("MATCH (p:Person) WHERE p.age > 28 RETURN p.name ORDER BY p.name").unwrap();
+        let result = db
+            .query("MATCH (p:Person) WHERE p.age > 28 RETURN p.name ORDER BY p.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::String("Alice".into()));
         assert_eq!(result.rows[1][0], Value::String("Charlie".into()));
@@ -244,10 +249,14 @@ mod tests {
     #[test]
     fn set_property() {
         let mut db = Database::new();
-        db.query("CREATE (:Person {name: 'Alice', age: 30})").unwrap();
-        db.query("MATCH (p:Person {name: 'Alice'}) SET p.age = 31").unwrap();
+        db.query("CREATE (:Person {name: 'Alice', age: 30})")
+            .unwrap();
+        db.query("MATCH (p:Person {name: 'Alice'}) SET p.age = 31")
+            .unwrap();
 
-        let result = db.query("MATCH (p:Person {name: 'Alice'}) RETURN p.age").unwrap();
+        let result = db
+            .query("MATCH (p:Person {name: 'Alice'}) RETURN p.age")
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Int(31));
     }
 
@@ -255,7 +264,8 @@ mod tests {
     fn delete_node() {
         let mut db = Database::new();
         db.query("CREATE (:Person {name: 'Alice'})").unwrap();
-        db.query("MATCH (p:Person {name: 'Alice'}) DELETE p").unwrap();
+        db.query("MATCH (p:Person {name: 'Alice'}) DELETE p")
+            .unwrap();
 
         let result = db.query("MATCH (p:Person) RETURN p.name").unwrap();
         assert_eq!(result.rows.len(), 0);
@@ -281,7 +291,9 @@ mod tests {
         db.query("CREATE (:N {v: 3})").unwrap();
         db.query("CREATE (:N {v: 4})").unwrap();
 
-        let result = db.query("MATCH (n:N) RETURN n.v ORDER BY n.v SKIP 1 LIMIT 2").unwrap();
+        let result = db
+            .query("MATCH (n:N) RETURN n.v ORDER BY n.v SKIP 1 LIMIT 2")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::Int(2));
         assert_eq!(result.rows[1][0], Value::Int(3));
@@ -333,9 +345,12 @@ mod tests {
         db.query("CREATE (:N {name: 'B'})").unwrap();
         db.query("CREATE (:N {name: 'C'})").unwrap();
         db.query("CREATE (:N {name: 'D'})").unwrap();
-        db.query("MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:E]->(b)").unwrap();
-        db.query("MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:E]->(c)").unwrap();
-        db.query("MATCH (c:N {name: 'C'}), (d:N {name: 'D'}) CREATE (c)-[:E]->(d)").unwrap();
+        db.query("MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:E]->(b)")
+            .unwrap();
+        db.query("MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:E]->(c)")
+            .unwrap();
+        db.query("MATCH (c:N {name: 'C'}), (d:N {name: 'D'}) CREATE (c)-[:E]->(d)")
+            .unwrap();
     }
 
     #[test]
@@ -343,9 +358,9 @@ mod tests {
         // *  = 1..unbounded — from A should reach B, C, D
         let mut db = Database::new();
         setup_chain(&mut db);
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E*]->(b:N) RETURN b.name ORDER BY b.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E*]->(b:N) RETURN b.name ORDER BY b.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.rows[0][0], Value::String("B".into()));
         assert_eq!(result.rows[1][0], Value::String("C".into()));
@@ -357,9 +372,9 @@ mod tests {
         // *2 = exactly 2 hops — from A should reach C only
         let mut db = Database::new();
         setup_chain(&mut db);
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E*2]->(b:N) RETURN b.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E*2]->(b:N) RETURN b.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::String("C".into()));
     }
@@ -369,9 +384,9 @@ mod tests {
         // *1..2 = 1 to 2 hops — from A should reach B and C
         let mut db = Database::new();
         setup_chain(&mut db);
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E*1..2]->(b:N) RETURN b.name ORDER BY b.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E*1..2]->(b:N) RETURN b.name ORDER BY b.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::String("B".into()));
         assert_eq!(result.rows[1][0], Value::String("C".into()));
@@ -382,9 +397,9 @@ mod tests {
         // *2.. = 2+ hops — from A should reach C and D
         let mut db = Database::new();
         setup_chain(&mut db);
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E*2..]->(b:N) RETURN b.name ORDER BY b.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E*2..]->(b:N) RETURN b.name ORDER BY b.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::String("C".into()));
         assert_eq!(result.rows[1][0], Value::String("D".into()));
@@ -395,9 +410,9 @@ mod tests {
         // *..2 = 1 to 2 hops — from A should reach B and C
         let mut db = Database::new();
         setup_chain(&mut db);
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E*..2]->(b:N) RETURN b.name ORDER BY b.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E*..2]->(b:N) RETURN b.name ORDER BY b.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0][0], Value::String("B".into()));
         assert_eq!(result.rows[1][0], Value::String("C".into()));
@@ -469,7 +484,8 @@ mod tests {
     fn is_null() {
         let mut db = Database::new();
         db.query("CREATE (:N {name: 'a'})").unwrap();
-        db.query("CREATE (:N {name: 'b', email: 'b@test'})").unwrap();
+        db.query("CREATE (:N {name: 'b', email: 'b@test'})")
+            .unwrap();
 
         let result = db
             .query("MATCH (n:N) WHERE n.email IS NULL RETURN n.name")
@@ -482,7 +498,8 @@ mod tests {
     fn is_not_null() {
         let mut db = Database::new();
         db.query("CREATE (:N {name: 'a'})").unwrap();
-        db.query("CREATE (:N {name: 'b', email: 'b@test'})").unwrap();
+        db.query("CREATE (:N {name: 'b', email: 'b@test'})")
+            .unwrap();
 
         let result = db
             .query("MATCH (n:N) WHERE n.email IS NOT NULL RETURN n.name")
@@ -559,21 +576,25 @@ mod tests {
         db.query("CREATE (:N {name: 'B'})").unwrap();
         db.query("CREATE (:N {name: 'C'})").unwrap();
         db.query("CREATE (:N {name: 'D'})").unwrap();
-        db.query("MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:E]->(b)").unwrap();
-        db.query("MATCH (a:N {name: 'A'}), (c:N {name: 'C'}) CREATE (a)-[:E]->(c)").unwrap();
-        db.query("MATCH (b:N {name: 'B'}), (d:N {name: 'D'}) CREATE (b)-[:E]->(d)").unwrap();
-        db.query("MATCH (c:N {name: 'C'}), (d:N {name: 'D'}) CREATE (c)-[:E]->(d)").unwrap();
+        db.query("MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:E]->(b)")
+            .unwrap();
+        db.query("MATCH (a:N {name: 'A'}), (c:N {name: 'C'}) CREATE (a)-[:E]->(c)")
+            .unwrap();
+        db.query("MATCH (b:N {name: 'B'}), (d:N {name: 'D'}) CREATE (b)-[:E]->(d)")
+            .unwrap();
+        db.query("MATCH (c:N {name: 'C'}), (d:N {name: 'D'}) CREATE (c)-[:E]->(d)")
+            .unwrap();
 
         // Without DISTINCT: two-hop from A reaches D twice (via B and via C)
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E]->(m:N)-[:E]->(d:N) RETURN d.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E]->(m:N)-[:E]->(d:N) RETURN d.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
 
         // With DISTINCT: D appears only once
-        let result = db.query(
-            "MATCH (a:N {name: 'A'})-[:E]->(m:N)-[:E]->(d:N) RETURN DISTINCT d.name",
-        ).unwrap();
+        let result = db
+            .query("MATCH (a:N {name: 'A'})-[:E]->(m:N)-[:E]->(d:N) RETURN DISTINCT d.name")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::String("D".into()));
     }
@@ -590,9 +611,7 @@ mod tests {
         db.query("CREATE (:N {v: 4})").unwrap();
 
         // All 4 should be visible via scan
-        let result = db
-            .query("MATCH (n:N) RETURN n.v ORDER BY n.v")
-            .unwrap();
+        let result = db.query("MATCH (n:N) RETURN n.v ORDER BY n.v").unwrap();
         assert_eq!(result.rows.len(), 4);
         assert_eq!(result.rows[0][0], Value::Int(1));
         assert_eq!(result.rows[3][0], Value::Int(4));
@@ -692,14 +711,10 @@ mod tests {
         db.query("CREATE (:N {name: 'B'})").unwrap();
         db.query("CREATE (:N {name: 'C'})").unwrap();
 
-        db.query(
-            "MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:E]->(b)",
-        )
-        .unwrap();
-        db.query(
-            "MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:E]->(c)",
-        )
-        .unwrap();
+        db.query("MATCH (a:N {name: 'A'}), (b:N {name: 'B'}) CREATE (a)-[:E]->(b)")
+            .unwrap();
+        db.query("MATCH (b:N {name: 'B'}), (c:N {name: 'C'}) CREATE (b)-[:E]->(c)")
+            .unwrap();
 
         let result = db
             .query(

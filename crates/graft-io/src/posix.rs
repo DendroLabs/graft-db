@@ -76,7 +76,10 @@ impl IoBackend for PosixIoBackend {
             self.free_slots.push(handle.0);
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid file handle"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid file handle",
+            ))
         }
     }
 
@@ -114,21 +117,11 @@ impl IoBackend for PosixIoBackend {
         self.get_file(handle)?.write_all_at(buf, offset)
     }
 
-    fn read_at(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> io::Result<usize> {
+    fn read_at(&mut self, handle: FileHandle, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         self.get_file(handle)?.read_at(buf, offset)
     }
 
-    fn write_at(
-        &mut self,
-        handle: FileHandle,
-        offset: u64,
-        data: &[u8],
-    ) -> io::Result<usize> {
+    fn write_at(&mut self, handle: FileHandle, offset: u64, data: &[u8]) -> io::Result<usize> {
         self.get_file(handle)?.write_at(data, offset)
     }
 
@@ -246,11 +239,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut io = PosixIoBackend::new();
 
-        let fh1 = io.open(&dir.path().join("a"), &OpenOptions::create_read_write()).unwrap();
+        let fh1 = io
+            .open(&dir.path().join("a"), &OpenOptions::create_read_write())
+            .unwrap();
         io.close(fh1).unwrap();
 
         // Next open should reuse the slot
-        let fh2 = io.open(&dir.path().join("b"), &OpenOptions::create_read_write()).unwrap();
+        let fh2 = io
+            .open(&dir.path().join("b"), &OpenOptions::create_read_write())
+            .unwrap();
         assert_eq!(fh1, fh2);
         io.close(fh2).unwrap();
     }

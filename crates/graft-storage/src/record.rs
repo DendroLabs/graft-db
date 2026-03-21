@@ -292,7 +292,9 @@ impl PropertyRecord {
 
     pub fn int_value(&self) -> Option<i64> {
         if self.value_type == VALUE_TYPE_INT {
-            Some(i64::from_le_bytes(self.value_data[0..8].try_into().unwrap()))
+            Some(i64::from_le_bytes(
+                self.value_data[0..8].try_into().unwrap(),
+            ))
         } else {
             None
         }
@@ -300,7 +302,9 @@ impl PropertyRecord {
 
     pub fn float_value(&self) -> Option<f64> {
         if self.value_type == VALUE_TYPE_FLOAT {
-            Some(f64::from_le_bytes(self.value_data[0..8].try_into().unwrap()))
+            Some(f64::from_le_bytes(
+                self.value_data[0..8].try_into().unwrap(),
+            ))
         } else {
             None
         }
@@ -309,9 +313,7 @@ impl PropertyRecord {
     pub fn string_value(&self) -> Option<String> {
         if self.value_type == VALUE_TYPE_STRING {
             let len = self.value_data[0] as usize;
-            Some(
-                String::from_utf8_lossy(&self.value_data[1..1 + len]).into_owned(),
-            )
+            Some(String::from_utf8_lossy(&self.value_data[1..1 + len]).into_owned())
         } else {
             None
         }
@@ -457,8 +459,11 @@ mod tests {
     #[test]
     fn edge_record_deleted() {
         let mut rec = EdgeRecord::new(
-            EdgeId::new(0, 1), NodeId::new(0, 1), NodeId::new(0, 2),
-            LabelId::new(1), 1,
+            EdgeId::new(0, 1),
+            NodeId::new(0, 1),
+            NodeId::new(0, 2),
+            LabelId::new(1),
+            1,
         );
         assert!(!rec.is_deleted());
         rec.tx_max = 5;

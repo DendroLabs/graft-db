@@ -28,16 +28,10 @@ pub enum Plan {
     },
 
     /// Cartesian product of two independent patterns.
-    NestedLoop {
-        outer: Box<Plan>,
-        inner: Box<Plan>,
-    },
+    NestedLoop { outer: Box<Plan>, inner: Box<Plan> },
 
     /// Filter rows by a predicate.
-    Filter {
-        input: Box<Plan>,
-        predicate: Expr,
-    },
+    Filter { input: Box<Plan>, predicate: Expr },
 
     /// Project to specific columns.
     Project {
@@ -52,16 +46,10 @@ pub enum Plan {
     },
 
     /// Limit output row count.
-    Limit {
-        input: Box<Plan>,
-        count: u64,
-    },
+    Limit { input: Box<Plan>, count: u64 },
 
     /// Skip leading rows.
-    Skip {
-        input: Box<Plan>,
-        count: u64,
-    },
+    Skip { input: Box<Plan>, count: u64 },
 
     /// Create a node.
     CreateNode {
@@ -90,16 +78,10 @@ pub enum Plan {
     },
 
     /// Delete a node or edge.
-    Delete {
-        input: Box<Plan>,
-        variable: String,
-    },
+    Delete { input: Box<Plan>, variable: String },
 
     /// Compute aggregate functions over all input rows.
-    Aggregate {
-        input: Box<Plan>,
-        ops: Vec<AggOp>,
-    },
+    Aggregate { input: Box<Plan>, ops: Vec<AggOp> },
 
     /// Variable-length path expansion (BFS).
     VarExpand {
@@ -114,9 +96,7 @@ pub enum Plan {
     },
 
     /// Deduplicate rows.
-    Distinct {
-        input: Box<Plan>,
-    },
+    Distinct { input: Box<Plan> },
 }
 
 #[derive(Clone, Debug)]
@@ -319,7 +299,10 @@ fn plan_return(r: &ReturnClause, input: Option<Plan>) -> Result<Plan, PlanError>
             let (func, arg) = match &item.expr {
                 Expr::FunctionCall { name, args } => {
                     let func = parse_agg_function(name)?;
-                    let arg = args.first().cloned().unwrap_or(Expr::Literal(Literal::Null));
+                    let arg = args
+                        .first()
+                        .cloned()
+                        .unwrap_or(Expr::Literal(Literal::Null));
                     (func, arg)
                 }
                 _ => unreachable!("checked by all_agg"),
@@ -480,9 +463,7 @@ fn plan_path_pattern(
         };
         i += 1;
         let PathElement::Node(node) = &elements[i] else {
-            return Err(PlanError::InvalidPattern(
-                "expected node after edge".into(),
-            ));
+            return Err(PlanError::InvalidPattern("expected node after edge".into()));
         };
         i += 1;
 
@@ -690,9 +671,7 @@ mod tests {
 
     #[test]
     fn match_path() {
-        let plan = parse_and_plan(
-            "MATCH (a:Person)-[e:KNOWS]->(b:Person) RETURN a.name, b.name",
-        );
+        let plan = parse_and_plan("MATCH (a:Person)-[e:KNOWS]->(b:Person) RETURN a.name, b.name");
         assert!(matches!(plan, Plan::Project { .. }));
     }
 
@@ -710,9 +689,8 @@ mod tests {
 
     #[test]
     fn order_by_limit_skip() {
-        let plan = parse_and_plan(
-            "MATCH (p:Person) RETURN p.name ORDER BY p.age DESC LIMIT 10 SKIP 5",
-        );
+        let plan =
+            parse_and_plan("MATCH (p:Person) RETURN p.name ORDER BY p.age DESC LIMIT 10 SKIP 5");
         // Execution order: Sort → Skip → Limit → Project
         assert!(matches!(plan, Plan::Project { .. }));
     }
