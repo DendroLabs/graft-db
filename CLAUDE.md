@@ -24,8 +24,9 @@ crates/
 ├── graft-io/           # I/O abstraction: io_uring (Linux), posix (macOS), simulation
 ├── graft-txn/          # Transactions: MVCC, WAL, snapshot isolation, checkpoints
 ├── graft-query/        # Query engine: LALRPOP GQL parser, planner, push-based executor, scalar functions
+├── graft-repl/         # Replication: protocol, CommitBuffer, ReplicationSender/Receiver, WalRetention
 ├── graft-runtime/      # Shard-per-core runtime: ShardCluster (thread-per-shard), SPSC ring buffers, event loop, message passing
-├── graft-server/       # TCP server: ShardCluster backend, binary wire protocol, --shards flag
+├── graft-server/       # TCP server: ShardCluster backend, binary wire protocol, admin commands, metrics endpoint
 ├── graft-client/       # Sync Rust client library
 ├── graft-cli/          # Interactive REPL: rustyline + comfy-table, semicolon-terminated queries
 └── graft-sim/          # Simulation testing: deterministic I/O, fault injection
@@ -45,10 +46,12 @@ crates/
 - Edges owned by source node's shard
 - Inter-shard communication via SPSC lock-free ring buffers (cache-line padded, power-of-two capacity)
 - `ShardMessage` protocol for inter-shard request/response (ScanNodes, GetNode, GetNodeProperty, GetOutboundEdges, GetInboundEdges + their responses)
-- Custom cooperative event loop (no tokio on server): `poll_io → poll_messages → advance_queries → submit_io`
+- Custom cooperative event loop (no tokio on server): `poll_coordinator → poll_io → poll_messages → advance_queries → submit_io`
 - `build_shard_mesh()` creates a fully-interconnected topology of `ShardEventLoop` instances
 - Multi-shard `Database` with `StorageAccess` routing: round-robin node creation, NodeId-based shard routing, cross-shard scan fan-out
-- `ShardCluster`: production-path thread-per-shard executor — spawns N OS threads, each owning a `Shard`, coordinator routes queries via SPSC queues with fan-out for scans and targeted routing for point lookups
+- `ShardCluster`: production-path thread-per-shard executor — spawns N `ShardEventLoop` instances on OS threads, coordinator routes queries via SPSC queues with fan-out for scans and targeted routing for point lookups
+- Adaptive idle strategy: spin for 64 iterations then `thread::yield_now()`
+- Core pinning: optional `pin_to_core()` via `sched_setaffinity` (Linux) / `thread_policy_set` (macOS)
 - Single shared atomic: global commit counter (AtomicU64)
 
 ### Transaction Model
@@ -63,7 +66,7 @@ crates/
 - Edge chain traversal reads raw records for next pointers, checks visibility separately (invisible edges skipped without breaking chain)
 - `StorageAccess` trait has `begin_tx/commit_tx/abort_tx` (default no-ops for backward compat)
 - `ShardCluster` generates global tx_id via `AtomicU64`, routes `BeginTx/CommitTx/AbortTx` to all shard workers
-- Deferred: explicit `BEGIN`/`COMMIT`/`ROLLBACK` over wire protocol (requires per-connection tx state)
+- Explicit `BEGIN`/`COMMIT`/`ROLLBACK` over wire protocol with per-connection tx state, orphaned tx abort on disconnect
 
 ### Query Engine
 - LALRPOP parser (LR(1), build-time codegen) with hand-written lexer
@@ -79,7 +82,7 @@ crates/
 
 ### I/O Layer
 - `IoBackend: Send` trait with swappable implementations, `default_backend()` auto-selects best platform backend
-- `IoUringBackend` (Linux production): O_DIRECT for data files (bypasses kernel page cache), fdatasync for direct files, pread/pwrite fallback for WAL (small sequential writes), EINVAL fallback for filesystems without O_DIRECT (e.g. tmpfs)
+- `IoUringBackend` (Linux production): O_DIRECT for data files (bypasses kernel page cache), fdatasync for direct files, pread/pwrite fallback for WAL (small sequential writes), EINVAL fallback for filesystems without O_DIRECT (e.g. tmpfs), batched `write_pages_batch`/`sync_batch` for multi-SQE submission
 - `PosixIoBackend` (macOS dev), `SimIoBackend` (testing)
 - `Shard::open_with_io()` accepts `Box<dyn IoBackend + Send>` for caller-provided backends
 - All non-determinism behind injectable interfaces (I/O, time, RNG) for simulation testing
@@ -125,11 +128,16 @@ cargo run --bin graft-cli -- connect localhost:7687
 10. ~~MVCC transactions~~ — **done**: per-shard TransactionManager, auto-commit in executor, Snapshot visibility, own-writes, two-pass WAL recovery (committed-only replay), tx_min/tx_max stamping, edge chain MVCC traversal, 221 tests passing
 11. ~~io_uring backend~~ — **done**: IoUringBackend with O_DIRECT for data files, fdatasync, EINVAL fallback, Shard generic over IoBackend via Box<dyn IoBackend + Send>, default_backend() auto-selects io_uring on Linux
 12. ~~Group commit + benchmarks~~ — **done**: WAL group commit (write to OS page cache, fsync every 2ms/64 commits, ~50x durable write throughput), MVCC benchmarks (tx overhead, visibility), persistence benchmarks (WAL write, flush, recovery, ephemeral vs durable)
-13. **Next**: core pinning
+13. ~~Core pinning~~ — **done**: `affinity::pin_to_core()` with platform-conditional implementation (Linux `sched_setaffinity`, macOS advisory `thread_policy_set`), `ShardCluster::new_with_options(n, pin_cores)` and `open_with_options()`, server `--pin-cores` flag
+14. ~~Explicit wire transactions~~ — **done**: per-connection tx state, BEGIN/COMMIT/ROLLBACK over wire protocol, `BeginTxResponseMsg`, `ShardCluster::begin_explicit_tx/commit_explicit_tx/abort_explicit_tx/query_in_tx`, `Shard::set_active_tx()`, client `begin_tx/commit_tx/rollback_tx` methods, orphaned tx abort on disconnect, 230 tests passing
+15. ~~Event loop integration~~ — **done**: `ShardEventLoop` replaces `ShardWorker`, coordinator SPSC handling via `poll_coordinator()` phase in cooperative `tick()` loop, adaptive spinning (spin 64 then yield), unified codepath for inter-shard messages and coordinator requests
+16. ~~Batched io_uring~~ — **done**: `IoBackend::write_pages_batch()` and `sync_batch()` with default sequential implementations, `IoUringBackend` overrides with batched SQE submission (chunked by ring capacity), `Shard::flush()` uses batched writes and batched sync
+17. ~~Replication (Phases 8a-8e)~~ — **done**: `graft-repl` crate with replication protocol (ReplHello/WalBatch/WalAck/ReplStatus), CommitBuffer (per-tx WAL record buffering, release on commit, discard on abort), ReplicationSender (ships committed records, tracks per-replica ACK'd LSN), ReplicationReceiver (CRC-verified WAL batch deserialization and apply), WalRetention (retention window tracking based on min ACK'd LSN). Event loop `poll_replication()` phase (primary: drain committed WAL → outbound batches; replica: apply pending records). Server `--role` (standalone/primary/replica), `--primary`, `--replication-port` (7688), `--metrics-port` (9100) flags. Admin commands (`SHOW REPLICAS`, `SHOW REPLICATION STATUS`, `SHOW REPLICATION LAG`, `SHOW SHARD STATUS`, `PROMOTE REPLICA`). Write rejection on read-only replicas. HelloMsg extended with optional role/read_only/shards fields (backward-compatible). Client exposes `server_role()`/`is_read_only()`/`server_shards()`. CLI shows role in banner, backslash shortcuts (`\status`, `\replicas`, `\lag`, `\shards`). Prometheus `/metrics` endpoint with `graft_role` and `graft_shard_count` gauges, `/health` check. 266 tests passing.
+18. **Next**: replication network transport (TCP on port 7688), semi-sync/sync replication (Phase 8f), snapshot shipping (Phase 8g), automatic failover (Phase 8h)
 
 ## Key Dependencies
 
-lalrpop, rmp-serde, ahash, hashbrown, crossbeam, io-uring, rustyline, comfy-table, crc32c, thiserror, tracing, proptest, criterion, clap
+lalrpop, rmp-serde, ahash, hashbrown, crossbeam, io-uring, libc, rustyline, comfy-table, crc32c, thiserror, tracing, proptest, criterion, clap
 
 ## Design Principles
 
@@ -149,3 +157,4 @@ Comprehensive research documents are in `/research/`:
 - `03-ops-scalability-innovation.md` — Scale stories, emerging tech (CXL, FPGA, GraphRAG)
 - `04-database-as-os.md` — OS-integration approach, kernel bypass, historical precedent
 - `05-strategic-synthesis.md` — Strategic playbook, differentiators, blockers, wild ideas
+- `06-replication-design.md` — WAL-shipping primary-replica replication design outline
