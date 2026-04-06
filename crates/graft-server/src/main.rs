@@ -1,5 +1,6 @@
 mod admin;
 mod metrics;
+mod replication;
 
 use std::io::{BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
@@ -78,18 +79,54 @@ fn main() {
         std::process::exit(1);
     }
 
-    let db = if let Some(ref data_dir) = args.data_dir {
-        let cluster = ShardCluster::open_with_options(args.shards, data_dir, args.pin_cores)
-            .unwrap_or_else(|e| {
-                eprintln!("failed to open data directory {}: {e}", data_dir.display());
-                std::process::exit(1);
-            });
-        Arc::new(Mutex::new(cluster))
-    } else {
-        Arc::new(Mutex::new(ShardCluster::new_with_options(
-            args.shards,
-            args.pin_cores,
-        )))
+    let (db, repl_handles) = match role {
+        ReplicationRole::Primary => {
+            if let Some(ref data_dir) = args.data_dir {
+                let (cluster, handles) =
+                    ShardCluster::open_primary(args.shards, data_dir, args.pin_cores)
+                        .unwrap_or_else(|e| {
+                            eprintln!("failed to open data directory {}: {e}", data_dir.display());
+                            std::process::exit(1);
+                        });
+                (Arc::new(Mutex::new(cluster)), Some(handles))
+            } else {
+                let (cluster, handles) = ShardCluster::new_primary(args.shards, args.pin_cores);
+                (Arc::new(Mutex::new(cluster)), Some(handles))
+            }
+        }
+        ReplicationRole::Replica => {
+            if let Some(ref data_dir) = args.data_dir {
+                let (cluster, handles) =
+                    ShardCluster::open_replica(args.shards, data_dir, args.pin_cores)
+                        .unwrap_or_else(|e| {
+                            eprintln!("failed to open data directory {}: {e}", data_dir.display());
+                            std::process::exit(1);
+                        });
+                (Arc::new(Mutex::new(cluster)), Some(handles))
+            } else {
+                let (cluster, handles) = ShardCluster::new_replica(args.shards, args.pin_cores);
+                (Arc::new(Mutex::new(cluster)), Some(handles))
+            }
+        }
+        ReplicationRole::Standalone => {
+            if let Some(ref data_dir) = args.data_dir {
+                let cluster =
+                    ShardCluster::open_with_options(args.shards, data_dir, args.pin_cores)
+                        .unwrap_or_else(|e| {
+                            eprintln!("failed to open data directory {}: {e}", data_dir.display());
+                            std::process::exit(1);
+                        });
+                (Arc::new(Mutex::new(cluster)), None)
+            } else {
+                (
+                    Arc::new(Mutex::new(ShardCluster::new_with_options(
+                        args.shards,
+                        args.pin_cores,
+                    ))),
+                    None,
+                )
+            }
+        }
     };
 
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
@@ -121,15 +158,28 @@ fn main() {
         eprintln!("metrics: http://{metrics_addr}/metrics");
     }
 
+    // Start replication network transport
+    if let Some(handles) = repl_handles {
+        match role {
+            ReplicationRole::Primary => {
+                let repl_addr = format!("{}:{}", args.host, args.replication_port);
+                replication::run_primary_listener(repl_addr, handles);
+            }
+            ReplicationRole::Replica => {
+                let primary_addr = args.primary.clone().unwrap();
+                replication::run_replica_connector(primary_addr, handles);
+            }
+            ReplicationRole::Standalone => {}
+        }
+    }
+
     let shard_count = args.shards;
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let db = Arc::clone(&db);
                 std::thread::spawn(move || {
-                    if let Err(e) =
-                        handle_connection(stream, db, role, is_read_only, shard_count)
-                    {
+                    if let Err(e) = handle_connection(stream, db, role, is_read_only, shard_count) {
                         tracing::debug!("connection closed: {e}");
                     }
                 });
@@ -283,10 +333,7 @@ fn handle_connection(
                         }
                         send_summary(
                             &mut writer,
-                            &admin::to_summary_msg(
-                                &admin_result,
-                                elapsed.as_millis() as u64,
-                            ),
+                            &admin::to_summary_msg(&admin_result, elapsed.as_millis() as u64),
                         )?;
                         writer.flush()?;
                         continue;

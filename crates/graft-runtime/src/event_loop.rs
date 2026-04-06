@@ -2,7 +2,9 @@ use std::thread;
 
 use graft_core::ShardId;
 use graft_query::executor::StorageAccess;
-use graft_repl::{ReplicationReceiver, ReplicationSender};
+use graft_repl::{
+    ReplControl, ReplicationReceiver, ReplicationSender, SharedQueue, WalAckMsg, WalBatchMsg,
+};
 
 use crate::cluster::{Request, Response};
 use crate::message::ShardMessage;
@@ -39,6 +41,16 @@ pub struct ShardEventLoop {
     repl_sender: Option<ReplicationSender>,
     /// Replication receiver (replica mode) — receives and applies WAL records from primary.
     repl_receiver: Option<ReplicationReceiver>,
+    /// Primary: outbound batches for network writer thread.
+    repl_outbox: Option<SharedQueue<WalBatchMsg>>,
+    /// Primary: ACKs from replicas via network reader thread.
+    repl_ack_inbox: Option<SharedQueue<(String, u64)>>,
+    /// Primary: dynamic replica registration from network acceptor.
+    repl_control: Option<SharedQueue<ReplControl>>,
+    /// Replica: inbound batches from network reader thread.
+    repl_inbox: Option<SharedQueue<WalBatchMsg>>,
+    /// Replica: outbound ACKs for network writer thread.
+    repl_ack_outbox: Option<SharedQueue<WalAckMsg>>,
 }
 
 impl ShardEventLoop {
@@ -59,6 +71,11 @@ impl ShardEventLoop {
             ticks: 0,
             repl_sender: None,
             repl_receiver: None,
+            repl_outbox: None,
+            repl_ack_inbox: None,
+            repl_control: None,
+            repl_inbox: None,
+            repl_ack_outbox: None,
         }
     }
 
@@ -80,6 +97,11 @@ impl ShardEventLoop {
             ticks: 0,
             repl_sender: None,
             repl_receiver: None,
+            repl_outbox: None,
+            repl_ack_inbox: None,
+            repl_control: None,
+            repl_inbox: None,
+            repl_ack_outbox: None,
         }
     }
 
@@ -92,6 +114,28 @@ impl ShardEventLoop {
     pub fn set_repl_receiver(&mut self, receiver: ReplicationReceiver) {
         self.shard.set_read_only(true);
         self.repl_receiver = Some(receiver);
+    }
+
+    /// Set primary-mode replication queues.
+    pub fn set_repl_primary_queues(
+        &mut self,
+        outbox: SharedQueue<WalBatchMsg>,
+        ack_inbox: SharedQueue<(String, u64)>,
+        control: SharedQueue<ReplControl>,
+    ) {
+        self.repl_outbox = Some(outbox);
+        self.repl_ack_inbox = Some(ack_inbox);
+        self.repl_control = Some(control);
+    }
+
+    /// Set replica-mode replication queues.
+    pub fn set_repl_replica_queues(
+        &mut self,
+        inbox: SharedQueue<WalBatchMsg>,
+        ack_outbox: SharedQueue<WalAckMsg>,
+    ) {
+        self.repl_inbox = Some(inbox);
+        self.repl_ack_outbox = Some(ack_outbox);
     }
 
     /// Access the replication sender (if in primary mode).
@@ -178,28 +222,83 @@ impl ShardEventLoop {
         work_done
     }
 
-    /// Poll replication: on primary, check for committed WAL records to ship;
-    /// on replica, apply received records to the shard.
+    /// Poll replication: on primary, drain WAL records from shard into sender,
+    /// push batches to outbox. On replica, drain inbox, apply records, push ACKs.
     fn poll_replication(&mut self) -> usize {
         let mut work = 0;
 
-        // Primary: poll sender for outbound batches
-        if let Some(ref mut sender) = self.repl_sender {
-            sender.poll();
-            let batches = sender.drain_outbound();
-            work += batches.len();
-            // Batches are available for the network layer to send.
-            // In Phase 8b, these will be written to TCP streams.
-            // For now, they are produced and dropped (network not yet wired).
-            let _ = batches;
+        // Primary path
+        if self.repl_sender.is_some() {
+            // 1. Process control messages (register/unregister replicas)
+            if let Some(ref control) = self.repl_control {
+                let msgs = control.drain();
+                work += msgs.len();
+                let sender = self.repl_sender.as_mut().unwrap();
+                for msg in msgs {
+                    match msg {
+                        ReplControl::Register {
+                            id,
+                            shard_id,
+                            last_lsn,
+                        } => sender.add_replica(id, shard_id, last_lsn),
+                        ReplControl::Unregister { id } => sender.remove_replica(&id),
+                    }
+                }
+            }
+
+            // 2. Drain repl_log from shard into sender
+            let records = self.shard.drain_repl_log();
+            work += records.len();
+            {
+                let sender = self.repl_sender.as_mut().unwrap();
+                for record in records {
+                    sender.on_wal_record(record);
+                }
+
+                // 3. Poll sender → drain batches → push to outbox
+                sender.poll();
+                let batches = sender.drain_outbound();
+                work += batches.len();
+                if let Some(ref outbox) = self.repl_outbox {
+                    outbox.push_batch(batches);
+                }
+            }
+
+            // 4. Drain ACK inbox → feed to sender
+            if let Some(ref ack_inbox) = self.repl_ack_inbox {
+                let acks = ack_inbox.drain();
+                work += acks.len();
+                let sender = self.repl_sender.as_mut().unwrap();
+                for (replica_id, lsn) in acks {
+                    sender.on_ack(&replica_id, lsn);
+                }
+            }
         }
 
-        // Replica: apply pending records from receiver
-        if let Some(ref mut receiver) = self.repl_receiver {
-            let records = receiver.drain_records();
+        // Replica path
+        if self.repl_receiver.is_some() {
+            // 1. Drain inbox → feed to receiver
+            if let Some(ref inbox) = self.repl_inbox {
+                let batches = inbox.drain();
+                work += batches.len();
+                let receiver = self.repl_receiver.as_mut().unwrap();
+                for batch in &batches {
+                    let _ = receiver.on_batch(batch);
+                }
+            }
+
+            // 2. Drain records → apply to shard
+            let records = self.repl_receiver.as_mut().unwrap().drain_records();
             work += records.len();
             for record in &records {
                 self.shard.apply_wal_record(record);
+            }
+
+            // 3. Drain ACKs → push to outbox
+            let acks = self.repl_receiver.as_mut().unwrap().drain_acks();
+            work += acks.len();
+            if let Some(ref ack_outbox) = self.repl_ack_outbox {
+                ack_outbox.push_batch(acks);
             }
         }
 
@@ -326,6 +425,7 @@ impl ShardEventLoop {
                 self.shard.abort_current_tx();
                 Response::Done
             }
+            Request::GetNextTxId => Response::TxId(self.shard.next_local_tx()),
             Request::Shutdown => unreachable!("handled in poll_coordinator"),
         }
     }
@@ -573,9 +673,7 @@ mod tests {
         }
 
         // Scan nodes via coordinator
-        req_tx
-            .push(Request::ScanNodes { label: None })
-            .unwrap();
+        req_tx.push(Request::ScanNodes { label: None }).unwrap();
         el.tick();
         let resp = resp_rx.pop().unwrap();
         match resp {
@@ -622,9 +720,7 @@ mod tests {
         assert!(matches!(resp_rx.pop().unwrap(), Response::Done));
 
         // Verify node visible after commit
-        req_tx
-            .push(Request::BeginTx { tx_id: 2 })
-            .unwrap();
+        req_tx.push(Request::BeginTx { tx_id: 2 }).unwrap();
         el.tick();
         resp_rx.pop(); // consume Done
 
@@ -682,6 +778,120 @@ mod tests {
         // No work on idle tick
         let work = el.tick();
         assert_eq!(work, 0);
+    }
+
+    #[test]
+    fn poll_replication_primary_feeds_outbox() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+
+        let mut shard = Shard::new(0);
+        shard.enable_replication();
+
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
+
+        let outbox = SharedQueue::new();
+        let ack_inbox = SharedQueue::new();
+        let control = SharedQueue::new();
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+        el.set_repl_sender(graft_repl::ReplicationSender::new(0));
+        el.set_repl_primary_queues(outbox.clone(), ack_inbox.clone(), control.clone());
+
+        // Create data via coordinator
+        req_tx.push(Request::BeginTx { tx_id: 1 }).unwrap();
+        el.tick();
+        resp_rx.pop(); // Done
+
+        req_tx
+            .push(Request::CreateNode {
+                label: Some("N".into()),
+                properties: vec![],
+            })
+            .unwrap();
+        el.tick();
+        resp_rx.pop(); // NodeId
+
+        req_tx.push(Request::CommitTx { tx_id: 1 }).unwrap();
+        el.tick();
+        resp_rx.pop(); // Done
+
+        // poll_replication should have drained repl_log into sender → outbox
+        // Might need a few extra ticks for the sender to poll
+        el.tick();
+        el.tick();
+
+        let batches = outbox.drain();
+        assert!(!batches.is_empty(), "expected outbox to have batches");
+        assert_eq!(batches[0].shard_id, 0);
+    }
+
+    #[test]
+    fn poll_replication_replica_applies_from_inbox() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+        use graft_repl::ReplicationSender;
+
+        // Create a batch using sender (simulating primary)
+        let mut sender = ReplicationSender::new(0);
+        use graft_txn::wal::{WalBody, WalRecord, WalRecordType};
+        sender.on_wal_record(WalRecord {
+            lsn: 1,
+            tx_id: 1,
+            record_type: WalRecordType::Begin,
+            body: WalBody::Empty,
+        });
+        // Create a node page write
+        use graft_core::constants::RECORD_SIZE;
+        use graft_core::NodeId;
+        use graft_storage::NodeRecord;
+        let node_id = NodeId::new(0, 1);
+        let node_rec = NodeRecord::new(node_id, graft_core::LabelId::NONE, 1);
+        let data = node_rec.to_bytes();
+        sender.on_wal_record(WalRecord {
+            lsn: 2,
+            tx_id: 1,
+            record_type: WalRecordType::PageWrite,
+            body: WalBody::PageWrite {
+                page_id: 1,
+                slot: 0,
+                page_type: 1,
+                data,
+            },
+        });
+        sender.on_wal_record(WalRecord {
+            lsn: 3,
+            tx_id: 1,
+            record_type: WalRecordType::Commit,
+            body: WalBody::Empty,
+        });
+        sender.poll();
+        let batches = sender.drain_outbound();
+        assert_eq!(batches.len(), 1);
+
+        // Set up replica event loop
+        let shard = Shard::new(0);
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, _resp_rx) = spsc::channel::<Response>(64);
+
+        let inbox = SharedQueue::new();
+        let ack_outbox = SharedQueue::new();
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+        el.set_repl_receiver(graft_repl::ReplicationReceiver::new(0));
+        el.set_repl_replica_queues(inbox.clone(), ack_outbox.clone());
+
+        // Push batch to inbox
+        inbox.push(batches[0].clone());
+
+        // Tick to process
+        el.tick();
+
+        // Verify ACK was produced
+        let acks = ack_outbox.drain();
+        assert!(!acks.is_empty(), "expected ACK in ack_outbox");
+        assert_eq!(acks[0].shard_id, 0);
     }
 
     #[test]

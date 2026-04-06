@@ -128,6 +128,9 @@ pub struct Shard {
     // Replication state
     read_only: bool,
     last_applied_lsn: u64,
+    repl_enabled: bool,
+    repl_log: Vec<graft_txn::wal::WalRecord>,
+    repl_next_lsn: u64,
 
     // I/O + WAL — None for ephemeral shards
     io: Option<RefCell<Box<dyn IoBackend + Send>>>,
@@ -165,6 +168,9 @@ impl Shard {
             commits_since_sync: 0,
             read_only: false,
             last_applied_lsn: 0,
+            repl_enabled: false,
+            repl_log: Vec::new(),
+            repl_next_lsn: 1,
             io: None,
             wal: None,
             node_file: None,
@@ -526,6 +532,9 @@ impl Shard {
             commits_since_sync: 0,
             read_only: false,
             last_applied_lsn: 0,
+            repl_enabled: false,
+            repl_log: Vec::new(),
+            repl_next_lsn: 1,
             io: Some(RefCell::new(io)),
             wal: Some(RefCell::new(wal)),
             node_file: Some(node_fh),
@@ -543,7 +552,13 @@ impl Shard {
     /// The next local transaction ID this shard would assign.
     /// Used by ShardCluster to initialize its global counter after recovery.
     pub fn next_local_tx(&self) -> TxId {
-        self.next_local_tx
+        // tx_mgr may have been advanced past next_local_tx by apply_wal_record
+        let mgr_next = self.tx_mgr.next_tx_id();
+        if mgr_next > self.next_local_tx {
+            mgr_next
+        } else {
+            self.next_local_tx
+        }
     }
 
     /// Whether this shard is in read-only mode (replica).
@@ -556,6 +571,17 @@ impl Shard {
         self.read_only = read_only;
     }
 
+    /// Enable replication WAL record capture. When enabled, mutations push
+    /// WalRecord entries into `repl_log` for the event loop to drain.
+    pub fn enable_replication(&mut self) {
+        self.repl_enabled = true;
+    }
+
+    /// Drain captured replication WAL records.
+    pub fn drain_repl_log(&mut self) -> Vec<graft_txn::wal::WalRecord> {
+        std::mem::take(&mut self.repl_log)
+    }
+
     /// The last LSN applied from replication.
     pub fn last_applied_lsn(&self) -> u64 {
         self.last_applied_lsn
@@ -566,12 +592,9 @@ impl Shard {
     /// This applies the record directly to the in-memory data structures
     /// (buffer pools, indexes) without writing to the local WAL — the
     /// replica's WAL is the record stream from the primary.
-    pub fn apply_wal_record(
-        &mut self,
-        record: &graft_txn::wal::WalRecord,
-    ) {
+    pub fn apply_wal_record(&mut self, record: &graft_txn::wal::WalRecord) {
         use graft_storage::page::PageType;
-        use graft_storage::record::{ENTITY_TYPE_NODE};
+        use graft_storage::record::ENTITY_TYPE_NODE;
         use graft_storage::{EdgeRecord, NodeRecord, PropertyRecord};
         use graft_txn::wal::{WalBody, WalRecordType};
 
@@ -590,10 +613,16 @@ impl Shard {
                             *page_id,
                             PageType::Node,
                         );
-                        Self::write_record_to_pool_inline(&mut self.node_pool, *page_id, *slot, data);
+                        Self::write_record_to_pool_inline(
+                            &mut self.node_pool,
+                            *page_id,
+                            *slot,
+                            data,
+                        );
                         let rec = NodeRecord::read_from(data);
                         if !rec.is_deleted() && !rec.node_id.is_null() {
-                            self.node_index.insert(rec.node_id.as_u64(), (*page_id, *slot));
+                            self.node_index
+                                .insert(rec.node_id.as_u64(), (*page_id, *slot));
                             let local = rec.node_id.local_id();
                             if local >= self.next_node_local {
                                 self.next_node_local = local + 1;
@@ -613,10 +642,16 @@ impl Shard {
                             *page_id,
                             PageType::Edge,
                         );
-                        Self::write_record_to_pool_inline(&mut self.edge_pool, *page_id, *slot, data);
+                        Self::write_record_to_pool_inline(
+                            &mut self.edge_pool,
+                            *page_id,
+                            *slot,
+                            data,
+                        );
                         let rec = EdgeRecord::read_from(data);
                         if !rec.is_deleted() && !rec.edge_id.is_null() {
-                            self.edge_index.insert(rec.edge_id.as_u64(), (*page_id, *slot));
+                            self.edge_index
+                                .insert(rec.edge_id.as_u64(), (*page_id, *slot));
                             let local = rec.edge_id.local_id();
                             if local >= self.next_edge_local {
                                 self.next_edge_local = local + 1;
@@ -636,7 +671,12 @@ impl Shard {
                             *page_id,
                             PageType::PropertyOverflow,
                         );
-                        Self::write_record_to_pool_inline(&mut self.prop_pool, *page_id, *slot, data);
+                        Self::write_record_to_pool_inline(
+                            &mut self.prop_pool,
+                            *page_id,
+                            *slot,
+                            data,
+                        );
                         let rec = PropertyRecord::read_from(data);
                         if rec.entity_id != 0 {
                             let idx = match rec.entity_type {
@@ -948,49 +988,69 @@ impl Shard {
         }
     }
 
-    /// Log a page write to the WAL.
-    fn log_page_write(&self, page_id: PageId, slot: u16, data: &[u8; RECORD_SIZE], page_type: u8) {
+    /// Log a page write to the WAL (and replication log if enabled).
+    fn log_page_write(
+        &mut self,
+        page_id: PageId,
+        slot: u16,
+        data: &[u8; RECORD_SIZE],
+        page_type: u8,
+    ) {
+        let body = WalBody::PageWrite {
+            page_id,
+            slot,
+            page_type,
+            data: *data,
+        };
         if let Some(ref wal_cell) = self.wal {
             let mut wal = wal_cell.borrow_mut();
-            wal.append(
-                self.current_tx,
-                WalRecordType::PageWrite,
-                &WalBody::PageWrite {
-                    page_id,
-                    slot,
-                    page_type,
-                    data: *data,
-                },
-            );
+            wal.append(self.current_tx, WalRecordType::PageWrite, &body);
             if wal.should_flush() {
                 if let Some(ref io_cell) = self.io {
                     let _ = wal.write(&mut **io_cell.borrow_mut());
                 }
             }
         }
+        if self.repl_enabled {
+            let lsn = self.repl_next_lsn;
+            self.repl_next_lsn += 1;
+            self.repl_log.push(graft_txn::wal::WalRecord {
+                lsn,
+                tx_id: self.current_tx,
+                record_type: WalRecordType::PageWrite,
+                body,
+            });
+        }
     }
 
-    /// Log a label creation to the WAL.
-    fn log_label_write(&self, id: LabelId, name: &str) {
+    /// Log a label creation to the WAL (and replication log if enabled).
+    fn log_label_write(&mut self, id: LabelId, name: &str) {
+        let mut data = [0u8; RECORD_SIZE];
+        LabelDictionary::write_label_record(id, name, &mut data);
+        let body = WalBody::PageWrite {
+            page_id: 0,
+            slot: 0,
+            page_type: PageType::Label as u8,
+            data,
+        };
         if let Some(ref wal_cell) = self.wal {
-            let mut data = [0u8; RECORD_SIZE];
-            LabelDictionary::write_label_record(id, name, &mut data);
             let mut wal = wal_cell.borrow_mut();
-            wal.append(
-                self.current_tx,
-                WalRecordType::PageWrite,
-                &WalBody::PageWrite {
-                    page_id: 0,
-                    slot: 0,
-                    page_type: PageType::Label as u8,
-                    data,
-                },
-            );
+            wal.append(self.current_tx, WalRecordType::PageWrite, &body);
             if wal.should_flush() {
                 if let Some(ref io_cell) = self.io {
                     let _ = wal.write(&mut **io_cell.borrow_mut());
                 }
             }
+        }
+        if self.repl_enabled {
+            let lsn = self.repl_next_lsn;
+            self.repl_next_lsn += 1;
+            self.repl_log.push(graft_txn::wal::WalRecord {
+                lsn,
+                tx_id: self.current_tx,
+                record_type: WalRecordType::PageWrite,
+                body,
+            });
         }
     }
 
@@ -1004,6 +1064,16 @@ impl Shard {
         self.tx_mgr.begin_with_id(tx_id, wal_opt);
         self.current_tx = tx_id;
         self.current_snapshot = self.tx_mgr.snapshot(tx_id).cloned();
+        if self.repl_enabled {
+            let lsn = self.repl_next_lsn;
+            self.repl_next_lsn += 1;
+            self.repl_log.push(graft_txn::wal::WalRecord {
+                lsn,
+                tx_id,
+                record_type: WalRecordType::Begin,
+                body: WalBody::Empty,
+            });
+        }
     }
 
     /// Commit the current transaction.
@@ -1028,6 +1098,17 @@ impl Shard {
                 None => None,
             };
             let _ = self.tx_mgr.commit(tx_id, wal_opt, io_opt);
+        }
+
+        if self.repl_enabled {
+            let lsn = self.repl_next_lsn;
+            self.repl_next_lsn += 1;
+            self.repl_log.push(graft_txn::wal::WalRecord {
+                lsn,
+                tx_id,
+                record_type: WalRecordType::Commit,
+                body: WalBody::Empty,
+            });
         }
 
         self.current_tx = 0;
@@ -1072,6 +1153,16 @@ impl Shard {
         let mut wal_ref = self.wal.as_ref().map(|w| w.borrow_mut());
         let wal_opt = wal_ref.as_deref_mut();
         self.tx_mgr.abort(tx_id, wal_opt);
+        if self.repl_enabled {
+            let lsn = self.repl_next_lsn;
+            self.repl_next_lsn += 1;
+            self.repl_log.push(graft_txn::wal::WalRecord {
+                lsn,
+                tx_id,
+                record_type: WalRecordType::Abort,
+                body: WalBody::Empty,
+            });
+        }
         self.current_tx = 0;
         self.current_snapshot = None;
     }
@@ -1127,7 +1218,7 @@ impl Shard {
         Some(rec)
     }
 
-    fn write_node_record(&self, page_id: PageId, slot: u16, rec: &NodeRecord) {
+    fn write_node_record(&mut self, page_id: PageId, slot: u16, rec: &NodeRecord) {
         let bytes = rec.to_bytes();
         {
             let mut pool = self.node_pool.borrow_mut();
@@ -1150,7 +1241,7 @@ impl Shard {
         Some(rec)
     }
 
-    fn write_edge_record(&self, page_id: PageId, slot: u16, rec: &EdgeRecord) {
+    fn write_edge_record(&mut self, page_id: PageId, slot: u16, rec: &EdgeRecord) {
         let bytes = rec.to_bytes();
         {
             let mut pool = self.edge_pool.borrow_mut();
@@ -1173,7 +1264,7 @@ impl Shard {
         Some(rec)
     }
 
-    fn write_prop_record(&self, page_id: PageId, slot: u16, rec: &PropertyRecord) {
+    fn write_prop_record(&mut self, page_id: PageId, slot: u16, rec: &PropertyRecord) {
         let bytes = rec.to_bytes();
         {
             let mut pool = self.prop_pool.borrow_mut();
@@ -2144,5 +2235,71 @@ mod tests {
             );
             shard.commit_tx();
         }
+    }
+
+    #[test]
+    fn repl_log_disabled_by_default() {
+        let mut shard = Shard::new(0);
+        shard.begin_tx();
+        shard.create_node(Some("N"), &[]);
+        shard.commit_tx();
+        assert!(shard.drain_repl_log().is_empty());
+    }
+
+    #[test]
+    fn repl_log_captures_tx_lifecycle() {
+        let mut shard = Shard::new(0);
+        shard.enable_replication();
+
+        shard.begin_tx_with_id(1);
+        shard.create_node(Some("N"), &[("k".into(), Value::Int(1))]);
+        shard.commit_current_tx();
+
+        let log = shard.drain_repl_log();
+        // Begin + node write + prop write + label write + Commit
+        assert!(
+            log.len() >= 3,
+            "expected at least Begin + writes + Commit, got {}",
+            log.len()
+        );
+        assert_eq!(log[0].record_type, WalRecordType::Begin);
+        assert_eq!(log.last().unwrap().record_type, WalRecordType::Commit);
+        // All records should have tx_id 1
+        assert!(log.iter().all(|r| r.tx_id == 1));
+        // LSNs should be monotonically increasing
+        for w in log.windows(2) {
+            assert!(w[1].lsn > w[0].lsn);
+        }
+    }
+
+    #[test]
+    fn repl_log_captures_abort() {
+        let mut shard = Shard::new(0);
+        shard.enable_replication();
+
+        shard.begin_tx_with_id(1);
+        shard.create_node(Some("N"), &[]);
+        shard.abort_current_tx();
+
+        let log = shard.drain_repl_log();
+        assert!(log.len() >= 2);
+        assert_eq!(log[0].record_type, WalRecordType::Begin);
+        assert_eq!(log.last().unwrap().record_type, WalRecordType::Abort);
+    }
+
+    #[test]
+    fn repl_log_drain_clears() {
+        let mut shard = Shard::new(0);
+        shard.enable_replication();
+
+        shard.begin_tx_with_id(1);
+        shard.create_node(Some("N"), &[]);
+        shard.commit_current_tx();
+
+        let log1 = shard.drain_repl_log();
+        assert!(!log1.is_empty());
+
+        let log2 = shard.drain_repl_log();
+        assert!(log2.is_empty());
     }
 }

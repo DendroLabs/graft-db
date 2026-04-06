@@ -7,7 +7,7 @@ pub mod message;
 pub mod shard;
 pub mod spsc;
 
-pub use cluster::ShardCluster;
+pub use cluster::{ReplHandles, ShardCluster, ShardReplQueues};
 pub use database::Database;
 pub use event_loop::{build_shard_mesh, ShardEventLoop};
 pub use shard::{Shard, ShardConfig};

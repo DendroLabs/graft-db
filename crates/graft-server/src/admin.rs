@@ -9,11 +9,7 @@ pub struct AdminResult {
 
 /// Try to parse and execute an admin command. Returns None if the query
 /// is not an admin command (i.e., it should be passed to the GQL engine).
-pub fn try_execute(
-    query: &str,
-    role: ReplicationRole,
-    shard_count: usize,
-) -> Option<AdminResult> {
+pub fn try_execute(query: &str, role: ReplicationRole, shard_count: usize) -> Option<AdminResult> {
     let upper = query.trim().to_uppercase();
 
     if upper == "SHOW REPLICAS" {
@@ -56,11 +52,7 @@ fn show_replicas(role: ReplicationRole) -> AdminResult {
 
 fn show_replication_status(role: ReplicationRole, shard_count: usize) -> AdminResult {
     AdminResult {
-        columns: vec![
-            "role".into(),
-            "shards".into(),
-            "mode".into(),
-        ],
+        columns: vec!["role".into(), "shards".into(), "mode".into()],
         rows: vec![vec![
             role.to_string(),
             shard_count.to_string(),
@@ -91,10 +83,7 @@ fn show_replication_lag(role: ReplicationRole) -> AdminResult {
 fn show_shard_status(shard_count: usize) -> AdminResult {
     // TODO: wire up actual shard stats via GetShardStats request
     AdminResult {
-        columns: vec![
-            "shard".into(),
-            "status".into(),
-        ],
+        columns: vec!["shard".into(), "status".into()],
         rows: (0..shard_count)
             .map(|i| vec![i.to_string(), "running".into()])
             .collect(),

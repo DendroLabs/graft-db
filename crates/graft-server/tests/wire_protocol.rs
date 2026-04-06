@@ -344,7 +344,9 @@ fn explicit_tx_multi_statement_over_wire() {
     assert_eq!(result.rows[0][0], "3");
 
     // Modify within tx
-    client.query("MATCH (n:N {name: 'b'}) SET n.v = 99").unwrap();
+    client
+        .query("MATCH (n:N {name: 'b'}) SET n.v = 99")
+        .unwrap();
     client.query("MATCH (n:N {name: 'c'}) DELETE n").unwrap();
 
     let result = client
@@ -384,9 +386,7 @@ fn auto_commit_queries_between_explicit_txs() {
     client.rollback_tx().unwrap();
 
     // Should see 3 nodes (v=1, v=2, v=3; v=4 was rolled back)
-    let result = client
-        .query("MATCH (n:N) RETURN n.v ORDER BY n.v")
-        .unwrap();
+    let result = client.query("MATCH (n:N) RETURN n.v ORDER BY n.v").unwrap();
     assert_eq!(result.rows.len(), 3);
     assert_eq!(result.rows[0][0], "1");
     assert_eq!(result.rows[1][0], "2");
@@ -409,8 +409,6 @@ fn multi_shard_explicit_tx_over_wire() {
 
     client.commit_tx().unwrap();
 
-    let result = client
-        .query("MATCH (n:N) RETURN n.v ORDER BY n.v")
-        .unwrap();
+    let result = client.query("MATCH (n:N) RETURN n.v ORDER BY n.v").unwrap();
     assert_eq!(result.rows.len(), 8);
 }

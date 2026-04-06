@@ -5,6 +5,7 @@ use std::thread::{self, JoinHandle};
 use graft_core::{EdgeId, NodeId, ShardId, TxId};
 use graft_query::executor::{EdgeInfo, NodeInfo, StorageAccess, Value};
 use graft_query::{self, QueryResult};
+use graft_repl::{ReplControl, SharedQueue, WalAckMsg, WalBatchMsg};
 
 use crate::affinity;
 use crate::event_loop::ShardEventLoop;
@@ -77,6 +78,7 @@ pub(crate) enum Request {
     AbortTx {
         tx_id: TxId,
     },
+    GetNextTxId,
     Flush,
     Shutdown,
 }
@@ -89,6 +91,7 @@ pub(crate) enum Response {
     Edges(Vec<EdgeInfo>),
     NodeId(NodeId),
     EdgeId(EdgeId),
+    TxId(TxId),
     Done,
 }
 
@@ -143,6 +146,30 @@ impl Drop for ShardHandle {
             let _ = handle.join();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replication handles — per-shard SharedQueues for network transport
+// ---------------------------------------------------------------------------
+
+/// Per-shard replication queues, consumed by network transport threads.
+pub struct ShardReplQueues {
+    pub shard_id: ShardId,
+    /// Primary: outbound WAL batches.
+    pub outbox: Option<SharedQueue<WalBatchMsg>>,
+    /// Primary: inbound ACKs (replica_id, acked_lsn).
+    pub ack_inbox: Option<SharedQueue<(String, u64)>>,
+    /// Replica: inbound WAL batches.
+    pub inbox: Option<SharedQueue<WalBatchMsg>>,
+    /// Replica: outbound ACKs.
+    pub ack_outbox: Option<SharedQueue<WalAckMsg>>,
+    /// Primary: dynamic replica register/unregister.
+    pub control: Option<SharedQueue<ReplControl>>,
+}
+
+/// All per-shard replication queues for the cluster, handed to the network layer.
+pub struct ReplHandles {
+    pub shards: Vec<ShardReplQueues>,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +278,24 @@ impl ShardCluster {
     }
 
     fn spawn_worker(shard: Shard, shard_id: ShardId, pin_cores: bool) -> ShardHandle {
+        Self::spawn_worker_with_setup(shard, shard_id, pin_cores, |_| {})
+    }
+
+    fn spawn_worker_with_setup<F>(
+        shard: Shard,
+        shard_id: ShardId,
+        pin_cores: bool,
+        setup: F,
+    ) -> ShardHandle
+    where
+        F: FnOnce(&mut ShardEventLoop),
+    {
         let (req_tx, req_rx) = spsc::channel::<Request>(4096);
         let (resp_tx, resp_rx) = spsc::channel::<Response>(4096);
 
-        let event_loop = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+        let mut event_loop = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+        setup(&mut event_loop);
+
         let pin_core = if pin_cores {
             Some(shard_id as usize)
         } else {
@@ -276,6 +317,245 @@ impl ShardCluster {
             response_rx: resp_rx,
             thread: Some(thread),
         }
+    }
+
+    /// Spawn an ephemeral primary cluster. Returns `(cluster, repl_handles)`.
+    pub fn new_primary(n: usize, pin_cores: bool) -> (Self, ReplHandles) {
+        assert!((1..=256).contains(&n), "shard count must be 1..=256");
+        let mut handles = Vec::with_capacity(n);
+        let mut repl_shards = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let shard_id = i as ShardId;
+            let mut shard = Shard::new(shard_id);
+            shard.enable_replication();
+
+            let outbox = SharedQueue::new();
+            let ack_inbox = SharedQueue::new();
+            let control = SharedQueue::new();
+            let outbox_c = outbox.clone();
+            let ack_inbox_c = ack_inbox.clone();
+            let control_c = control.clone();
+
+            let handle = Self::spawn_worker_with_setup(shard, shard_id, pin_cores, move |el| {
+                el.set_repl_sender(graft_repl::ReplicationSender::new(shard_id));
+                el.set_repl_primary_queues(outbox_c, ack_inbox_c, control_c);
+            });
+            handles.push(handle);
+            repl_shards.push(ShardReplQueues {
+                shard_id,
+                outbox: Some(outbox),
+                ack_inbox: Some(ack_inbox),
+                inbox: None,
+                ack_outbox: None,
+                control: Some(control),
+            });
+        }
+
+        let cluster = Self {
+            handles,
+            next_shard: AtomicU8::new(0),
+            next_tx_id: AtomicU64::new(1),
+            current_tx: 0,
+            in_explicit_tx: false,
+            pin_cores,
+        };
+        (
+            cluster,
+            ReplHandles {
+                shards: repl_shards,
+            },
+        )
+    }
+
+    /// Spawn an ephemeral replica cluster. Returns `(cluster, repl_handles)`.
+    pub fn new_replica(n: usize, pin_cores: bool) -> (Self, ReplHandles) {
+        assert!((1..=256).contains(&n), "shard count must be 1..=256");
+        let mut handles = Vec::with_capacity(n);
+        let mut repl_shards = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let shard_id = i as ShardId;
+            let shard = Shard::new(shard_id);
+
+            let inbox = SharedQueue::new();
+            let ack_outbox = SharedQueue::new();
+            let inbox_c = inbox.clone();
+            let ack_outbox_c = ack_outbox.clone();
+
+            let handle = Self::spawn_worker_with_setup(shard, shard_id, pin_cores, move |el| {
+                el.set_repl_receiver(graft_repl::ReplicationReceiver::new(shard_id));
+                el.set_repl_replica_queues(inbox_c, ack_outbox_c);
+            });
+            handles.push(handle);
+            repl_shards.push(ShardReplQueues {
+                shard_id,
+                outbox: None,
+                ack_inbox: None,
+                inbox: Some(inbox),
+                ack_outbox: Some(ack_outbox),
+                control: None,
+            });
+        }
+
+        let cluster = Self {
+            handles,
+            next_shard: AtomicU8::new(0),
+            next_tx_id: AtomicU64::new(1),
+            current_tx: 0,
+            in_explicit_tx: false,
+            pin_cores,
+        };
+        (
+            cluster,
+            ReplHandles {
+                shards: repl_shards,
+            },
+        )
+    }
+
+    /// Open a durable primary cluster. Returns `(cluster, repl_handles)`.
+    pub fn open_primary(
+        n: usize,
+        data_dir: &Path,
+        pin_cores: bool,
+    ) -> std::io::Result<(Self, ReplHandles)> {
+        assert!((1..=256).contains(&n), "shard count must be 1..=256");
+
+        let mut shards = Vec::with_capacity(n);
+        let mut max_tx: TxId = 0;
+        for i in 0..n {
+            let shard_id = i as ShardId;
+            let config = ShardConfig {
+                data_dir: data_dir.to_owned(),
+                pool_capacity: 1024,
+            };
+            let mut shard = Shard::open(shard_id, &config)?;
+            shard.enable_replication();
+            if shard.next_local_tx() > max_tx {
+                max_tx = shard.next_local_tx();
+            }
+            shards.push(shard);
+        }
+
+        let mut handles = Vec::with_capacity(n);
+        let mut repl_shards = Vec::with_capacity(n);
+
+        for shard in shards {
+            let shard_id = shard.shard_id();
+            let outbox = SharedQueue::new();
+            let ack_inbox = SharedQueue::new();
+            let control = SharedQueue::new();
+            let outbox_c = outbox.clone();
+            let ack_inbox_c = ack_inbox.clone();
+            let control_c = control.clone();
+
+            let handle = Self::spawn_worker_with_setup(shard, shard_id, pin_cores, move |el| {
+                el.set_repl_sender(graft_repl::ReplicationSender::new(shard_id));
+                el.set_repl_primary_queues(outbox_c, ack_inbox_c, control_c);
+            });
+            handles.push(handle);
+            repl_shards.push(ShardReplQueues {
+                shard_id,
+                outbox: Some(outbox),
+                ack_inbox: Some(ack_inbox),
+                inbox: None,
+                ack_outbox: None,
+                control: Some(control),
+            });
+        }
+
+        Ok((
+            Self {
+                handles,
+                next_shard: AtomicU8::new(0),
+                next_tx_id: AtomicU64::new(max_tx),
+                current_tx: 0,
+                in_explicit_tx: false,
+                pin_cores,
+            },
+            ReplHandles {
+                shards: repl_shards,
+            },
+        ))
+    }
+
+    /// Open a durable replica cluster. Returns `(cluster, repl_handles)`.
+    pub fn open_replica(
+        n: usize,
+        data_dir: &Path,
+        pin_cores: bool,
+    ) -> std::io::Result<(Self, ReplHandles)> {
+        assert!((1..=256).contains(&n), "shard count must be 1..=256");
+
+        let mut shards = Vec::with_capacity(n);
+        let mut max_tx: TxId = 0;
+        for i in 0..n {
+            let shard_id = i as ShardId;
+            let config = ShardConfig {
+                data_dir: data_dir.to_owned(),
+                pool_capacity: 1024,
+            };
+            let shard = Shard::open(shard_id, &config)?;
+            if shard.next_local_tx() > max_tx {
+                max_tx = shard.next_local_tx();
+            }
+            shards.push(shard);
+        }
+
+        let mut handles = Vec::with_capacity(n);
+        let mut repl_shards = Vec::with_capacity(n);
+
+        for shard in shards {
+            let shard_id = shard.shard_id();
+            let inbox = SharedQueue::new();
+            let ack_outbox = SharedQueue::new();
+            let inbox_c = inbox.clone();
+            let ack_outbox_c = ack_outbox.clone();
+
+            let handle = Self::spawn_worker_with_setup(shard, shard_id, pin_cores, move |el| {
+                el.set_repl_receiver(graft_repl::ReplicationReceiver::new(shard_id));
+                el.set_repl_replica_queues(inbox_c, ack_outbox_c);
+            });
+            handles.push(handle);
+            repl_shards.push(ShardReplQueues {
+                shard_id,
+                outbox: None,
+                ack_inbox: None,
+                inbox: Some(inbox),
+                ack_outbox: Some(ack_outbox),
+                control: None,
+            });
+        }
+
+        Ok((
+            Self {
+                handles,
+                next_shard: AtomicU8::new(0),
+                next_tx_id: AtomicU64::new(max_tx),
+                current_tx: 0,
+                in_explicit_tx: false,
+                pin_cores,
+            },
+            ReplHandles {
+                shards: repl_shards,
+            },
+        ))
+    }
+
+    /// Sync the cluster's tx counter with the max across all shards.
+    /// This is needed on replicas where WAL replay advances shard-level
+    /// counters past the cluster's initial value.
+    fn sync_tx_counter(&self) {
+        let mut max_tx: TxId = self.next_tx_id.load(Ordering::Relaxed);
+        for handle in &self.handles {
+            if let Response::TxId(next) = handle.call(Request::GetNextTxId) {
+                if next > max_tx {
+                    max_tx = next;
+                }
+            }
+        }
+        self.next_tx_id.fetch_max(max_tx, Ordering::Relaxed);
     }
 
     /// Flush all shards to disk. Each shard flushes its WAL and dirty pages.
@@ -544,6 +824,8 @@ impl StorageAccess for ShardCluster {
         if self.in_explicit_tx {
             return self.current_tx;
         }
+        // Sync the counter in case shard-level tx_ids advanced (e.g., via replication).
+        self.sync_tx_counter();
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         self.current_tx = tx_id;
         for handle in &self.handles {
@@ -967,9 +1249,7 @@ mod tests {
         // Re-open — only Alice should survive
         {
             let mut cluster = ShardCluster::open(2, dir.path()).unwrap();
-            let result = cluster
-                .query("MATCH (p:Person) RETURN p.name")
-                .unwrap();
+            let result = cluster.query("MATCH (p:Person) RETURN p.name").unwrap();
             assert_eq!(result.rows.len(), 1);
             assert_eq!(result.rows[0][0], Value::String("Alice".into()));
         }
@@ -985,9 +1265,7 @@ mod tests {
         cluster
             .query_in_tx("CREATE (:N {name: 'a', v: 1})")
             .unwrap();
-        let result = cluster
-            .query_in_tx("MATCH (n:N) RETURN COUNT(*)")
-            .unwrap();
+        let result = cluster.query_in_tx("MATCH (n:N) RETURN COUNT(*)").unwrap();
         assert_eq!(result.rows[0][0], Value::Int(1));
 
         cluster
@@ -1015,9 +1293,7 @@ mod tests {
         cluster
             .query_in_tx("MATCH (n:N {name: 'b'}) DELETE n")
             .unwrap();
-        let result = cluster
-            .query_in_tx("MATCH (n:N) RETURN COUNT(*)")
-            .unwrap();
+        let result = cluster.query_in_tx("MATCH (n:N) RETURN COUNT(*)").unwrap();
         assert_eq!(result.rows[0][0], Value::Int(2));
 
         cluster.commit_explicit_tx();
@@ -1041,9 +1317,7 @@ mod tests {
             let mut cluster = ShardCluster::open(1, dir.path()).unwrap();
             // 127 records per page, so 200 nodes should span 2+ pages
             for i in 0..200 {
-                cluster
-                    .query(&format!("CREATE (:N {{v: {i}}})"))
-                    .unwrap();
+                cluster.query(&format!("CREATE (:N {{v: {i}}})")).unwrap();
             }
         }
 
