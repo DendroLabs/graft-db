@@ -297,3 +297,28 @@ milestone looks like it could exceed ~2x budget, split it in the task doc
 before spawning the coder rather than counting on WIND DOWN. The durable
 task doc (tasks/code-review-findings.md) + continue.txt handoff is what made
 rotation safe regardless.
+
+## Relay-build round 2 (write-conflict task): confirmations and two orchestration refinements
+
+**Watchdog confirmation**: second relay run, same pattern as the first — all
+three coders completed a full milestone in a single background turn (185k,
+149k, 171k tokens), so the 150k BUDGET watchdog never had a chance to fire
+mid-turn. Root-cause milestone scoping is, again, what actually controlled
+context size. Treat this as settled: size milestones in the task doc, don't
+count on WIND DOWN.
+
+**TaskStop after a CHECKPOINT is a no-op that errors**: a background coder
+that ends its turn with CHECKPOINT has already exited — `TaskStop` on its id
+returns "No task found". Harmless, but skip it: rotation is just "spawn the
+fresh coder"; there is nothing to stop.
+
+**Scope flags embedded in CHECKPOINT beat QUESTION for end-of-milestone
+decisions**: the M3 coder finished its milestone, then flagged the next one
+(M4, cross-shard commit atomicity) as adjacent scope needing human
+confirmation — inside its CHECKPOINT line rather than stopping mid-work with
+QUESTION. That let the orchestrator surface the decision to the user at the
+natural rotation boundary (with AskUserQuestion + a recommendation) instead
+of either blindly rotating a coder into unconfirmed scope or interrupting
+work. When a coder's plan contains a milestone beyond the literal task ask,
+"flag it in the plan + checkpoint before it" is the right protocol; the
+orchestrator should read checkpoints for such flags before auto-rotating.

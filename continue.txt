@@ -72,17 +72,27 @@ M3 (done, this session): concurrent explicit transactions at the cluster.
 
 ## Remaining Work
 
-1. **Milestone 4 — cross-shard commit atomicity (FLAGGED — DO NOT BUILD
-   without orchestrator/human scope confirmation)**: a multi-shard tx that
-   conflicts on one shard aborts there but commits on the others — the
-   client gets an error while the non-conflicting shards' writes are
-   visible. Fix sketch (todo.md Milestone 4 section): two-phase commit
-   under the coordinator mutex — extract the conflict-check loop into
+**None on this task — it is DONE as delivered.** The user was asked about
+Milestone 4 on 2026-07-09 and explicitly declined it for now. If resumed,
+the natural next steps are:
+
+1. Next roadmap item per CLAUDE.md's phase list (item 19): Phase 8g
+   snapshot shipping (recommended first — 4 known replication gaps depend
+   on it: evicted-replica resync, poison-survives-restart, reconnect
+   catch-up beyond queued backlog, new-replica bootstrap), then Phase
+   8f-durability (semi-sync), then Phase 8h (failover).
+2. **Milestone 4 — cross-shard commit atomicity (DECLINED for now, kept as
+   future work)**: a multi-shard tx that conflicts on one shard aborts
+   there but commits on the others — the client gets an error while the
+   non-conflicting shards' writes are visible. Fix sketch (todo.md
+   Milestone 4 section): two-phase commit under the coordinator mutex —
+   extract the conflict-check loop into
    `TransactionManager::validate(tx_id)`, add `Request::PrepareCommit`
-   fan-out, then CommitTx-all or AbortTx-all. This is adjacent scope
-   beyond the literal task ask. The gap is documented in
+   fan-out, then CommitTx-all or AbortTx-all. The gap is documented in
    `commit_explicit_tx()`'s doc comment and pre-announced in CLAUDE.md.
-   If the orchestrator declines M4, the task is DONE as delivered.
+3. Pre-existing adjacent gap, also not part of any task yet: property
+   records carry no tx_min/tx_max (overwritten in place, no MVCC
+   versioning) — see Pitfalls below.
 
 ## Key Decisions Already Made (don't re-litigate)
 

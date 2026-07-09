@@ -310,7 +310,7 @@ deviations. Notes for the next coder:
   commits on non-conflicting shards while the client gets an error.
   M4 remains FLAGGED — needs orchestrator/human scope confirmation.
 
-## Milestone 4 — Cross-shard commit atomicity (root cause: fan-out commit has no prepare phase) — FLAGGED, confirm scope before building
+## Milestone 4 — Cross-shard commit atomicity (root cause: fan-out commit has no prepare phase) — DECLINED 2026-07-09, kept as known future work
 
 Once Milestone 3 makes conflicts triggerable, a multi-shard tx that conflicts
 on one shard aborts there but commits on the others — the client gets an
@@ -322,6 +322,11 @@ This is adjacent scope beyond the literal task ask — get orchestrator/human
 confirmation before implementing. Until then the partial-commit anomaly is a
 documented, pre-announced gap (strictly better than today's silent lost
 updates).
+
+**Scope decision (2026-07-09)**: the user was asked and chose to STOP at the
+delivered scope — M1-M3 were committed as `bc99b39` and pushed; M4 was
+explicitly declined for now and remains future work with the fix sketch
+above. The write-conflict task is COMPLETE as delivered.
 
 ## Verification (every milestone)
 
