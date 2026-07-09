@@ -43,23 +43,24 @@ session-level summaries:
 - `graft-server` tests re-run 5x total (3x full crate, 2x the new
   timing-sensitive integration test in isolation): stable, no flakiness.
 
-**Nothing has been committed to git.** All changes across all 3 milestones
-(spanning `crates/graft-core`, `graft-io`, `graft-query`, `graft-repl`,
+**Committed to git.** All changes across all 3 milestones (spanning
+`crates/graft-core`, `graft-io`, `graft-query`, `graft-repl`,
 `graft-runtime`, `graft-server`, `graft-storage`, plus two new files —
 `crates/graft-repl/src/registry.rs` and `crates/graft-server/src/identity.rs`
-— and `CLAUDE.md`) remain as uncommitted working-tree changes. The user has
-not asked for a commit at any point in this multi-session task; don't
-create one unless explicitly asked.
+— and `CLAUDE.md`, `tasks/`, this file) were committed to `main` as
+`860b0b2` on 2026-07-09 at the user's explicit request, with a small
+follow-up doc commit after. The user noted the untested Linux-only
+`graft-io/src/uring.rs` change is acceptable for now ("not worried about a
+macOS version" — i.e. macOS is only the dev box; verify on Linux
+eventually).
 
 ## Remaining Work
 
-None on this task. If resumed, the natural next questions are:
-1. Does the user want these changes committed (and if so, as one commit or
-   per-milestone)?
-2. Move on to the next roadmap item per `CLAUDE.md`'s phase list (item 19):
+None on this task. If resumed, the natural next steps are:
+1. Move on to the next roadmap item per `CLAUDE.md`'s phase list (item 19):
    semi-sync/sync replication (Phase 8f-durability), snapshot shipping
    (Phase 8g), or automatic failover (Phase 8h).
-3. Two out-of-scope gaps were discovered and explicitly flagged (not part
+2. Two out-of-scope gaps were discovered and explicitly flagged (not part
    of the 15 findings, not fixed) — see `tasks/todo.md`'s Milestone 3
    result section for full detail:
    - `Shard` never calls `TransactionManager::record_write()` from any

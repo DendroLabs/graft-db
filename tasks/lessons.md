@@ -220,3 +220,28 @@ it directly. That's a legitimate way to test fix *logic* in isolation from a
 *trigger path* that doesn't exist yet — just say so explicitly, both in the
 test's comments and in the handoff, so nobody mistakes "the fix is tested"
 for "the bug is currently reachable in production."
+
+## Relay-build orchestration: the token watchdog can't fire mid-turn
+
+**The problem**: the /relay-build skill has a 150k-token BUDGET watchdog that
+tells a coder to WIND DOWN when its accumulated tokens cross the threshold.
+In the Phase 8f review-fix relay (2026-07-09), all three coders ran an entire
+milestone in a single background turn (~226k-323k tokens each), so the
+orchestrator only saw the token count *after* each turn ended — the watchdog
+never had a chance to fire.
+
+**Why it's easy to miss**: the skill reads as if the orchestrator can
+intervene continuously; in practice a background agent's usage is only
+reported at turn end, so any coder that doesn't stop mid-milestone (QUESTION
+or CHECKPOINT) is invisible until it's done.
+
+**What actually controls context size**: milestone scoping in the coder
+protocol, not the budget number. Milestones sized as "one root-cause cluster
+of findings" kept every coder well under context limits even at 2x the
+nominal budget, and each ended at a verified safe point.
+
+**How to apply next time**: treat BUDGET as a between-turn check only. If a
+milestone looks like it could exceed ~2x budget, split it in the task doc
+before spawning the coder rather than counting on WIND DOWN. The durable
+task doc (tasks/code-review-findings.md) + continue.txt handoff is what made
+rotation safe regardless.
