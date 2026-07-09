@@ -30,7 +30,7 @@ fn bench_wal_write(c: &mut Criterion) {
                     for i in 0..n {
                         shard.begin_tx();
                         shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
-                        shard.commit_tx();
+                        shard.commit_tx().unwrap();
                     }
                     black_box(&shard);
                 },
@@ -63,7 +63,7 @@ fn bench_flush(c: &mut Criterion) {
                     for i in 0..n {
                         shard.begin_tx();
                         shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
-                        shard.commit_tx();
+                        shard.commit_tx().unwrap();
                     }
                     (dir, shard)
                 },
@@ -100,7 +100,7 @@ fn bench_recovery(c: &mut Criterion) {
                 for i in 0..n {
                     shard.begin_tx();
                     shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
-                    shard.commit_tx();
+                    shard.commit_tx().unwrap();
                 }
                 // Drop without flush — WAL has all committed records, data files don't
             }
@@ -133,7 +133,7 @@ fn bench_recovery(c: &mut Criterion) {
                 for i in 0..n {
                     shard.begin_tx();
                     shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
-                    shard.commit_tx();
+                    shard.commit_tx().unwrap();
                 }
                 shard.flush().unwrap();
             }
@@ -181,7 +181,7 @@ fn bench_durable_query(c: &mut Criterion) {
                 ("age".into(), Value::Int(20 + (i % 50))),
             ],
         );
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
     }
     shard.flush().unwrap();
 
@@ -189,7 +189,7 @@ fn bench_durable_query(c: &mut Criterion) {
         b.iter(|| {
             shard.begin_tx();
             let nodes = shard.scan_nodes(Some("Person"));
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             black_box(nodes);
         });
     });
@@ -198,7 +198,7 @@ fn bench_durable_query(c: &mut Criterion) {
         let nodes = {
             shard.begin_tx();
             let n = shard.scan_nodes(Some("Person"));
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             n
         };
         let ids: Vec<_> = nodes.iter().map(|n| n.id).collect();
@@ -206,7 +206,7 @@ fn bench_durable_query(c: &mut Criterion) {
         b.iter(|| {
             shard.begin_tx();
             black_box(shard.get_node(ids[i % ids.len()]));
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             i += 1;
         });
     });
@@ -216,7 +216,7 @@ fn bench_durable_query(c: &mut Criterion) {
         b.iter(|| {
             shard.begin_tx();
             shard.create_node(Some("Bench"), &[("v".into(), Value::Int(i))]);
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             i += 1;
         });
     });
@@ -240,7 +240,7 @@ fn bench_ephemeral_vs_durable(c: &mut Criterion) {
                 for i in 0..n {
                     shard.begin_tx();
                     shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
-                    shard.commit_tx();
+                    shard.commit_tx().unwrap();
                 }
                 black_box(&shard);
             },
@@ -265,7 +265,7 @@ fn bench_ephemeral_vs_durable(c: &mut Criterion) {
                 for i in 0..n {
                     shard.begin_tx();
                     shard.create_node(Some("N"), &[("v".into(), Value::Int(i as i64))]);
-                    shard.commit_tx();
+                    shard.commit_tx().unwrap();
                 }
                 black_box(&shard);
             },

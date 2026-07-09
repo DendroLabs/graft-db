@@ -418,7 +418,7 @@ fn bench_tx_begin_commit(c: &mut Criterion) {
         let mut shard = Shard::new(0);
         b.iter(|| {
             let tx = shard.begin_tx();
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             black_box(tx);
         });
     });
@@ -429,7 +429,7 @@ fn bench_tx_begin_commit(c: &mut Criterion) {
         b.iter(|| {
             shard.begin_tx();
             shard.create_node(Some("N"), &[("v".into(), Value::Int(1))]);
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
         });
     });
 
@@ -439,12 +439,12 @@ fn bench_tx_begin_commit(c: &mut Criterion) {
         for i in 0..1_000 {
             shard.begin_tx();
             shard.create_node(Some("N"), &[("v".into(), Value::Int(i))]);
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
         }
         b.iter(|| {
             shard.begin_tx();
             let nodes = shard.scan_nodes(Some("N"));
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             black_box(nodes);
         });
     });
@@ -457,12 +457,12 @@ fn bench_tx_begin_commit(c: &mut Criterion) {
             shard.begin_tx();
             let id = shard.create_node(Some("P"), &[("v".into(), Value::Int(i))]);
             ids.push(id);
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
         }
         for i in 0..99 {
             shard.begin_tx();
             shard.create_edge(ids[i], ids[i + 1], Some("E"), &[]);
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
         }
         let first = ids[0];
         b.iter(|| {
@@ -476,7 +476,7 @@ fn bench_tx_begin_commit(c: &mut Criterion) {
                     break;
                 }
             }
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
             black_box(current);
         });
     });

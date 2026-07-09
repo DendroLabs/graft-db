@@ -159,7 +159,7 @@ fn replica_query_tx_ids_never_collide_with_replicated_primary_tx_ids() {
         "replica query tx_id {replica_tx_id} must be far outside the low \
          range real primary tx_ids (starting at 1) ever use"
     );
-    replica.abort_explicit_tx();
+    replica.abort_explicit_tx(replica_tx_id);
 }
 
 /// Regression test for finding #1: a single shared outbox used to be

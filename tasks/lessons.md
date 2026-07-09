@@ -1,5 +1,16 @@
 # Lessons Learned
 
+## `WalBatchMsg.records` is raw serialized WAL bytes, not structured records
+
+When a test needs to assert on the *contents* of a shipped replication batch
+(e.g. "no record of the losing tx may ship"), `batch.records` cannot be
+iterated as `WalRecord`s — it's a `Vec<u8>` of WAL-format bytes
+(header + body + CRC per record, built by `sender.rs`'s
+`records_to_batch`). Deserialize first with
+`graft_repl::receiver::deserialize_wal_records(&batch.records)`. Caught
+before a build cycle this time only because the struct was checked before
+writing the assertion — the field name reads like a `Vec<WalRecord>`.
+
 ## `cargo clippy -- -D warnings` was not actually clean on `main` before this work
 
 **Problem**: Running the mandated verification command
@@ -220,6 +231,47 @@ it directly. That's a legitimate way to test fix *logic* in isolation from a
 *trigger path* that doesn't exist yet — just say so explicitly, both in the
 test's comments and in the handoff, so nobody mistakes "the fix is tested"
 for "the bug is currently reachable in production."
+
+## A `replace_all` edit after targeted edits can silently clobber them when the pattern is a substring of the edited line
+
+**Problem**: converting ~10 test call sites of `shard.commit_current_tx();` to
+`.unwrap()` via replace_all ALSO matched inside a line a targeted edit had
+just created (`let result = shard.commit_current_tx();` — the pattern is a
+substring), turning it into `let result = ...unwrap();` and breaking the
+test's type (`()` vs `Result`), caught only at the next build.
+
+**How to avoid next time**: do the broad `replace_all` FIRST, then apply the
+targeted exceptions on top — or make the replace pattern anchored enough
+(include leading indentation/context) that it can't match inside lines other
+edits produced.
+
+## Conflict-test value assertions must account for non-MVCC-versioned records: order writes so the winner writes LAST
+
+**Problem (Milestone 3, write-conflict task)**: the natural way to write "loser's
+commit errors, winner's value persists" is winner-writes-then-loser-writes.
+With graft's current storage that test would fail its final-value assertion:
+property records are overwritten IN PLACE with no tx_min/tx_max (pre-existing
+gap noted in M2's result), so whichever transaction physically wrote last is
+what a later read returns — even if that transaction's commit correctly came
+back as a WriteConflict error and it was aborted.
+
+**Why it's easy to miss**: the commit Ok/Err assertions pass in either
+ordering, and on a dev run the failure would look like conflict detection
+returning the wrong winner, sending you into the (correct) TransactionManager
+logic; the actual culprit is the unrelated, pre-existing property-versioning
+gap.
+
+**Fix**: in both the cluster-level and wire-level conflict tests, the LOSER
+issues its SET first and the WINNER writes last, with a comment at each test
+explaining exactly why the ordering matters. The commit-result assertions are
+ordering-independent; only the final-value read-back needs this.
+
+**How to avoid next time**: before asserting on post-conflict/post-abort
+*values* (not just commit results), check whether the record type involved is
+actually MVCC-versioned. In graft today: node/edge records are (tx_min/tx_max
+stamped); property records are NOT. If it isn't versioned, structure the test
+so physical write order matches the logical outcome being asserted, and
+say so in a comment.
 
 ## Relay-build orchestration: the token watchdog can't fire mid-turn
 

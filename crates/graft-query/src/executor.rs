@@ -128,6 +128,7 @@ impl Default for Row {
 // QueryResult
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
@@ -180,7 +181,13 @@ pub trait StorageAccess {
     fn begin_tx(&mut self) -> u64 {
         0
     }
-    fn commit_tx(&mut self) {}
+    /// Commit the auto-commit transaction. `Err` means the commit did not
+    /// happen (e.g. a first-committer-wins write conflict) and the
+    /// transaction is already aborted by the storage layer — implementations
+    /// must not require a follow-up `abort_tx()`.
+    fn commit_tx(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn abort_tx(&mut self) {}
 }
 
@@ -194,6 +201,10 @@ pub enum ExecutionError {
     TypeError(String),
     DivisionByZero,
     UnknownFunction(String),
+    /// The query executed but its auto-commit failed (e.g. a
+    /// first-committer-wins write conflict). None of the query's writes took
+    /// effect — the storage layer aborted the transaction.
+    CommitFailed(String),
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -203,6 +214,7 @@ impl std::fmt::Display for ExecutionError {
             Self::TypeError(msg) => write!(f, "type error: {msg}"),
             Self::DivisionByZero => write!(f, "division by zero"),
             Self::UnknownFunction(name) => write!(f, "unknown function: {name}"),
+            Self::CommitFailed(msg) => write!(f, "commit failed: {msg}"),
         }
     }
 }
@@ -227,12 +239,18 @@ pub fn execute(
 
     let result = execute_plan(plan, storage);
 
-    match &result {
+    let commit_result = match &result {
         Ok(_) => storage.commit_tx(),
-        Err(_) => storage.abort_tx(),
-    }
+        Err(_) => {
+            storage.abort_tx();
+            Ok(())
+        }
+    };
 
     let rows = result?;
+    // A failed commit means none of the query's writes took effect; the
+    // storage layer already aborted the transaction (no abort_tx here).
+    commit_result.map_err(ExecutionError::CommitFailed)?;
 
     let columns = rows.first().map(|r| r.columns()).unwrap_or_default();
 
@@ -1074,6 +1092,10 @@ mod tests {
         edges: Vec<MemEdge>,
         next_node_id: u64,
         next_edge_id: u64,
+        /// When true, `commit_tx()` fails (simulates a write conflict).
+        fail_commits: bool,
+        /// Number of `abort_tx()` calls observed.
+        aborts: usize,
     }
 
     impl MemoryStorage {
@@ -1083,6 +1105,8 @@ mod tests {
                 edges: Vec::new(),
                 next_node_id: 1,
                 next_edge_id: 1,
+                fail_commits: false,
+                aborts: 0,
             }
         }
 
@@ -1250,6 +1274,18 @@ mod tests {
         fn delete_edge(&mut self, id: EdgeId) {
             self.edges.retain(|e| e.id != id);
         }
+
+        fn commit_tx(&mut self) -> Result<(), String> {
+            if self.fail_commits {
+                Err("write-write conflict (simulated)".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn abort_tx(&mut self) {
+            self.aborts += 1;
+        }
     }
 
     // -- Helper to run a query against a storage ----------------------------
@@ -1295,6 +1331,20 @@ mod tests {
     }
 
     // -- Tests --------------------------------------------------------------
+
+    #[test]
+    fn commit_failure_surfaces_as_execution_error() {
+        let mut s = setup_social_graph();
+        s.fail_commits = true;
+        let err = run("CREATE (:Person {name: 'Mallory'})", &mut s).unwrap_err();
+        assert!(
+            err.contains("commit failed: write-write conflict (simulated)"),
+            "auto-commit failure must surface as an execution error, got: {err}"
+        );
+        // The storage layer aborts internally on a failed commit; the
+        // executor must not issue a second abort.
+        assert_eq!(s.aborts, 0);
+    }
 
     #[test]
     fn scan_all_persons() {

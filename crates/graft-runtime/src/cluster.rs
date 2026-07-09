@@ -90,6 +90,10 @@ pub(crate) enum Response {
     Edges(Vec<EdgeInfo>),
     NodeId(NodeId),
     EdgeId(EdgeId),
+    /// Outcome of a `CommitTx` request. `Err` means the shard did not commit
+    /// (e.g. first-committer-wins write conflict) and has already aborted
+    /// the transaction locally.
+    CommitResult(Result<(), String>),
     Done,
 }
 
@@ -231,8 +235,20 @@ pub struct ShardCluster {
     handles: Vec<ShardHandle>,
     next_shard: AtomicU8,
     next_tx_id: AtomicU64,
+    /// Transient per-call execution context for the executor's
+    /// `StorageAccess` callbacks — NOT persistent connection state. Set by
+    /// `query_in_tx()` for the duration of a single `execute()` call (and by
+    /// `begin_tx()` on the auto-commit path, cleared by its matching
+    /// commit/abort); always 0 between public calls. Each connection's
+    /// active tx_id lives with the connection (e.g. graft-server's
+    /// per-connection `active_tx`) and is passed into `query_in_tx`/
+    /// `commit_explicit_tx`/`abort_explicit_tx` explicitly, so any number of
+    /// transactions can be concurrently active.
     current_tx: TxId,
-    /// When true, auto-commit begin/commit/abort in the executor are suppressed.
+    /// True only while `query_in_tx()` is inside `executor::execute()`, so
+    /// the executor's auto-commit begin/commit/abort callbacks become no-ops
+    /// that join the explicit transaction instead. Always false between
+    /// public calls.
     in_explicit_tx: bool,
     pin_cores: bool,
 }
@@ -606,54 +622,65 @@ impl ShardCluster {
     }
 
     /// Begin an explicit multi-statement transaction. Returns the tx_id.
-    /// Subsequent calls to `query()` within this tx will suppress auto-commit.
+    ///
+    /// Any number of explicit transactions may be concurrently active (each
+    /// shard's TransactionManager tracks N active transactions); callers
+    /// identify theirs by passing the returned tx_id to `query_in_tx`/
+    /// `commit_explicit_tx`/`abort_explicit_tx`.
     pub fn begin_explicit_tx(&mut self) -> TxId {
-        assert!(!self.in_explicit_tx, "already in an explicit transaction");
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         for handle in &self.handles {
             handle.call(Request::BeginTx { tx_id });
         }
-        self.current_tx = tx_id;
-        self.in_explicit_tx = true;
         tx_id
     }
 
-    /// Commit the current explicit transaction.
-    pub fn commit_explicit_tx(&mut self) {
-        assert!(self.in_explicit_tx, "no explicit transaction active");
-        let tx_id = self.current_tx;
+    /// Commit the explicit transaction `tx_id`.
+    ///
+    /// `Err` means at least one shard rejected the commit (first-committer-
+    /// wins write conflict) and aborted the transaction locally. Every shard
+    /// is still driven to resolve its side of the transaction regardless.
+    /// Known gap (tasks/todo.md Milestone 4): there is no cross-shard
+    /// prepare phase yet, so on a multi-shard transaction the non-conflicting
+    /// shards will have committed their part even when this returns `Err`.
+    pub fn commit_explicit_tx(&mut self, tx_id: TxId) -> Result<(), String> {
+        let mut result = Ok(());
         for handle in &self.handles {
-            handle.call(Request::CommitTx { tx_id });
+            if let Response::CommitResult(Err(e)) = handle.call(Request::CommitTx { tx_id }) {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
         }
-        self.current_tx = 0;
-        self.in_explicit_tx = false;
+        result
     }
 
-    /// Abort the current explicit transaction.
-    pub fn abort_explicit_tx(&mut self) {
-        assert!(self.in_explicit_tx, "no explicit transaction active");
-        let tx_id = self.current_tx;
+    /// Abort the explicit transaction `tx_id`.
+    pub fn abort_explicit_tx(&mut self, tx_id: TxId) {
         for handle in &self.handles {
             handle.call(Request::AbortTx { tx_id });
         }
-        self.current_tx = 0;
-        self.in_explicit_tx = false;
     }
 
-    /// Execute a query within an explicit transaction. Restores tx context
-    /// on the shard workers before executing.
-    pub fn query_in_tx(&mut self, gql: &str) -> Result<QueryResult, String> {
-        assert!(self.in_explicit_tx, "no explicit transaction active");
-        let tx_id = self.current_tx;
-        // Restore tx context on all shards (may have been changed by
-        // other connections' auto-commit queries since last access)
+    /// Execute a query within the explicit transaction `tx_id`. Restores tx
+    /// context on the shard workers before executing.
+    pub fn query_in_tx(&mut self, tx_id: TxId, gql: &str) -> Result<QueryResult, String> {
+        // Restore tx context on all shards (other transactions' statements
+        // may have switched their active tx since this tx's last statement)
         for handle in &self.handles {
             handle.call(Request::SetActiveTx { tx_id });
         }
-        // Execute — begin_tx/commit_tx will be no-ops due to in_explicit_tx
         let ast = graft_query::parse(gql)?;
         let plan = graft_query::planner::plan(&ast).map_err(|e| format!("{e}"))?;
-        graft_query::executor::execute(&plan, self).map_err(|e| format!("{e}"))
+        // Transient context: for the duration of this execute() call the
+        // executor's begin_tx/commit_tx/abort_tx callbacks join this
+        // transaction (no-op) instead of auto-committing.
+        self.current_tx = tx_id;
+        self.in_explicit_tx = true;
+        let result = graft_query::executor::execute(&plan, self).map_err(|e| format!("{e}"));
+        self.current_tx = 0;
+        self.in_explicit_tx = false;
+        result
     }
 
     /// Pick next shard for round-robin node creation.
@@ -861,15 +888,21 @@ impl StorageAccess for ShardCluster {
         tx_id
     }
 
-    fn commit_tx(&mut self) {
+    fn commit_tx(&mut self) -> Result<(), String> {
         if self.in_explicit_tx {
-            return;
+            return Ok(());
         }
         let tx_id = self.current_tx;
+        let mut result = Ok(());
         for handle in &self.handles {
-            handle.call(Request::CommitTx { tx_id });
+            if let Response::CommitResult(Err(e)) = handle.call(Request::CommitTx { tx_id }) {
+                if result.is_ok() {
+                    result = Err(e);
+                }
+            }
         }
         self.current_tx = 0;
+        result
     }
 
     fn abort_tx(&mut self) {
@@ -1117,18 +1150,18 @@ mod tests {
 
         // Create within explicit tx
         cluster
-            .query_in_tx("CREATE (:Person {name: 'Alice'})")
+            .query_in_tx(tx_id, "CREATE (:Person {name: 'Alice'})")
             .unwrap();
 
         // Should be visible within the tx
         let result = cluster
-            .query_in_tx("MATCH (p:Person) RETURN p.name")
+            .query_in_tx(tx_id, "MATCH (p:Person) RETURN p.name")
             .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::String("Alice".into()));
 
         // Commit
-        cluster.commit_explicit_tx();
+        cluster.commit_explicit_tx(tx_id).unwrap();
 
         // Should be visible after commit via auto-commit query
         let result = cluster.query("MATCH (p:Person) RETURN p.name").unwrap();
@@ -1140,19 +1173,19 @@ mod tests {
     fn explicit_tx_rollback() {
         let mut cluster = ShardCluster::new(2);
 
-        cluster.begin_explicit_tx();
+        let tx_id = cluster.begin_explicit_tx();
         cluster
-            .query_in_tx("CREATE (:Person {name: 'Alice'})")
+            .query_in_tx(tx_id, "CREATE (:Person {name: 'Alice'})")
             .unwrap();
 
         // Visible within tx
         let result = cluster
-            .query_in_tx("MATCH (p:Person) RETURN p.name")
+            .query_in_tx(tx_id, "MATCH (p:Person) RETURN p.name")
             .unwrap();
         assert_eq!(result.rows.len(), 1);
 
         // Abort
-        cluster.abort_explicit_tx();
+        cluster.abort_explicit_tx(tx_id);
 
         // Should NOT be visible after abort
         let result = cluster.query("MATCH (p:Person) RETURN p.name").unwrap();
@@ -1167,18 +1200,18 @@ mod tests {
         cluster.query("CREATE (:Person {name: 'Bob'})").unwrap();
 
         // Start explicit tx
-        cluster.begin_explicit_tx();
+        let tx_id = cluster.begin_explicit_tx();
         cluster
-            .query_in_tx("CREATE (:Person {name: 'Alice'})")
+            .query_in_tx(tx_id, "CREATE (:Person {name: 'Alice'})")
             .unwrap();
 
         // Both should be visible within the tx
         let result = cluster
-            .query_in_tx("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+            .query_in_tx(tx_id, "MATCH (p:Person) RETURN p.name ORDER BY p.name")
             .unwrap();
         assert_eq!(result.rows.len(), 2);
 
-        cluster.commit_explicit_tx();
+        cluster.commit_explicit_tx(tx_id).unwrap();
 
         let result = cluster
             .query("MATCH (p:Person) RETURN p.name ORDER BY p.name")
@@ -1231,14 +1264,14 @@ mod tests {
         // Create data via explicit tx in a durable cluster
         {
             let mut cluster = ShardCluster::open(2, dir.path()).unwrap();
-            cluster.begin_explicit_tx();
+            let tx_id = cluster.begin_explicit_tx();
             cluster
-                .query_in_tx("CREATE (:Person {name: 'Alice'})")
+                .query_in_tx(tx_id, "CREATE (:Person {name: 'Alice'})")
                 .unwrap();
             cluster
-                .query_in_tx("CREATE (:Person {name: 'Bob'})")
+                .query_in_tx(tx_id, "CREATE (:Person {name: 'Bob'})")
                 .unwrap();
-            cluster.commit_explicit_tx();
+            cluster.commit_explicit_tx(tx_id).unwrap();
             // Drop triggers flush
         }
 
@@ -1266,11 +1299,11 @@ mod tests {
             cluster.query("CREATE (:Person {name: 'Alice'})").unwrap();
 
             // Begin explicit tx, create another, then rollback
-            cluster.begin_explicit_tx();
+            let tx_id = cluster.begin_explicit_tx();
             cluster
-                .query_in_tx("CREATE (:Person {name: 'Ghost'})")
+                .query_in_tx(tx_id, "CREATE (:Person {name: 'Ghost'})")
                 .unwrap();
-            cluster.abort_explicit_tx();
+            cluster.abort_explicit_tx(tx_id);
         }
 
         // Re-open — only Alice should survive
@@ -1286,29 +1319,31 @@ mod tests {
     fn explicit_tx_multi_statement_interleaved() {
         let mut cluster = ShardCluster::new(2);
 
-        cluster.begin_explicit_tx();
+        let tx_id = cluster.begin_explicit_tx();
 
         // Create, read, create more, read again
         cluster
-            .query_in_tx("CREATE (:N {name: 'a', v: 1})")
+            .query_in_tx(tx_id, "CREATE (:N {name: 'a', v: 1})")
             .unwrap();
-        let result = cluster.query_in_tx("MATCH (n:N) RETURN COUNT(*)").unwrap();
+        let result = cluster
+            .query_in_tx(tx_id, "MATCH (n:N) RETURN COUNT(*)")
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Int(1));
 
         cluster
-            .query_in_tx("CREATE (:N {name: 'b', v: 2})")
+            .query_in_tx(tx_id, "CREATE (:N {name: 'b', v: 2})")
             .unwrap();
         cluster
-            .query_in_tx("CREATE (:N {name: 'c', v: 3})")
+            .query_in_tx(tx_id, "CREATE (:N {name: 'c', v: 3})")
             .unwrap();
 
         // SET within the tx
         cluster
-            .query_in_tx("MATCH (n:N {name: 'a'}) SET n.v = 100")
+            .query_in_tx(tx_id, "MATCH (n:N {name: 'a'}) SET n.v = 100")
             .unwrap();
 
         let result = cluster
-            .query_in_tx("MATCH (n:N) RETURN n.name, n.v ORDER BY n.name")
+            .query_in_tx(tx_id, "MATCH (n:N) RETURN n.name, n.v ORDER BY n.name")
             .unwrap();
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.rows[0][0], Value::String("a".into()));
@@ -1318,12 +1353,14 @@ mod tests {
 
         // DELETE within the tx
         cluster
-            .query_in_tx("MATCH (n:N {name: 'b'}) DELETE n")
+            .query_in_tx(tx_id, "MATCH (n:N {name: 'b'}) DELETE n")
             .unwrap();
-        let result = cluster.query_in_tx("MATCH (n:N) RETURN COUNT(*)").unwrap();
+        let result = cluster
+            .query_in_tx(tx_id, "MATCH (n:N) RETURN COUNT(*)")
+            .unwrap();
         assert_eq!(result.rows[0][0], Value::Int(2));
 
-        cluster.commit_explicit_tx();
+        cluster.commit_explicit_tx(tx_id).unwrap();
 
         // Verify post-commit
         let result = cluster
@@ -1411,11 +1448,11 @@ mod tests {
             "explicit BEGIN on a replica must draw from the reserved high \
              range, not collide with a primary's low tx_id range"
         );
-        cluster.commit_explicit_tx();
+        cluster.commit_explicit_tx(tx_id).unwrap();
 
         let tx_id_2 = cluster.begin_explicit_tx();
         assert!(tx_id_2 > tx_id, "successive explicit tx_ids must advance");
-        cluster.abort_explicit_tx();
+        cluster.abort_explicit_tx(tx_id_2);
     }
 
     #[test]
@@ -1428,5 +1465,100 @@ mod tests {
 
         let cluster = ShardCluster::new(1);
         assert_eq!(cluster.next_tx_id.load(Ordering::Relaxed), 1);
+    }
+
+    // -- Milestone 3 regression tests: concurrent explicit transactions ----
+    // The coordinator used to have ONE global tx context: a second
+    // concurrent BEGIN panicked an assert, and an auto-commit query during
+    // an open explicit tx silently joined it. With tx_id-parameterized
+    // methods, N transactions are concurrently active and first-committer-
+    // wins conflicts finally trigger through the cluster API.
+
+    #[test]
+    fn concurrent_explicit_txs_conflicting_writes_second_committer_loses() {
+        let mut cluster = ShardCluster::new(1);
+        cluster.query("CREATE (:N {name: 'x', v: 0})").unwrap();
+
+        // Two transactions concurrently active — the second BEGIN used to
+        // panic `assert!(!self.in_explicit_tx)`.
+        let tx_a = cluster.begin_explicit_tx();
+        let tx_b = cluster.begin_explicit_tx();
+        assert_ne!(tx_a, tx_b);
+
+        // Loser (tx_b) writes FIRST, winner (tx_a) writes LAST: property
+        // records are overwritten in place with no MVCC versioning
+        // (pre-existing gap, see Milestone 2's result in tasks/todo.md), so
+        // this ordering keeps the final-value assertion meaningful.
+        cluster
+            .query_in_tx(tx_b, "MATCH (n:N) SET n.v = 2")
+            .unwrap();
+        cluster
+            .query_in_tx(tx_a, "MATCH (n:N) SET n.v = 1")
+            .unwrap();
+
+        // First committer wins; the second gets a WriteConflict.
+        cluster.commit_explicit_tx(tx_a).unwrap();
+        let err = cluster.commit_explicit_tx(tx_b).unwrap_err();
+        assert!(
+            err.contains("conflict"),
+            "loser's commit error should mention the conflict, got: {err}"
+        );
+
+        // Winner's value persists.
+        let result = cluster.query("MATCH (n:N) RETURN n.v").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Int(1));
+    }
+
+    #[test]
+    fn concurrent_explicit_txs_disjoint_writes_both_commit() {
+        let mut cluster = ShardCluster::new(1);
+        cluster.query("CREATE (:N {name: 'a', v: 0})").unwrap();
+        cluster.query("CREATE (:N {name: 'b', v: 0})").unwrap();
+
+        let tx_a = cluster.begin_explicit_tx();
+        let tx_b = cluster.begin_explicit_tx();
+
+        cluster
+            .query_in_tx(tx_a, "MATCH (n:N {name: 'a'}) SET n.v = 1")
+            .unwrap();
+        cluster
+            .query_in_tx(tx_b, "MATCH (n:N {name: 'b'}) SET n.v = 2")
+            .unwrap();
+
+        // Disjoint write sets: both commits must succeed.
+        cluster.commit_explicit_tx(tx_a).unwrap();
+        cluster.commit_explicit_tx(tx_b).unwrap();
+
+        let result = cluster
+            .query("MATCH (n:N) RETURN n.name, n.v ORDER BY n.name")
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][1], Value::Int(1));
+        assert_eq!(result.rows[1][1], Value::Int(2));
+    }
+
+    #[test]
+    fn auto_commit_query_does_not_join_open_explicit_tx() {
+        let mut cluster = ShardCluster::new(1);
+
+        let tx = cluster.begin_explicit_tx();
+        cluster
+            .query_in_tx(tx, "CREATE (:T {name: 'ghost'})")
+            .unwrap();
+
+        // An auto-commit query arriving while another connection's explicit
+        // tx is open used to silently JOIN that tx (begin_tx() returned the
+        // global current_tx) — its write would then vanish with the
+        // stranger's rollback. It must commit independently.
+        cluster.query("CREATE (:T {name: 'real'})").unwrap();
+
+        cluster.abort_explicit_tx(tx);
+
+        // The auto-commit write survives the explicit tx's abort; the
+        // explicit tx's write does not.
+        let result = cluster.query("MATCH (t:T) RETURN t.name").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::String("real".into()));
     }
 }

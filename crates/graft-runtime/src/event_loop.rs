@@ -434,8 +434,10 @@ impl ShardEventLoop {
             }
             Request::CommitTx { tx_id } => {
                 self.shard.set_active_tx(tx_id);
-                self.shard.commit_current_tx();
-                Response::Done
+                // Surface the result (e.g. first-committer-wins WriteConflict)
+                // to the coordinator; a failed commit is already aborted
+                // shard-side.
+                Response::CommitResult(self.shard.commit_current_tx().map_err(|e| e.to_string()))
             }
             Request::AbortTx { tx_id } => {
                 self.shard.set_active_tx(tx_id);
@@ -733,7 +735,10 @@ mod tests {
         // Commit
         req_tx.push(Request::CommitTx { tx_id: 1 }).unwrap();
         el.tick();
-        assert!(matches!(resp_rx.pop().unwrap(), Response::Done));
+        assert!(matches!(
+            resp_rx.pop().unwrap(),
+            Response::CommitResult(Ok(()))
+        ));
 
         // Verify node visible after commit
         req_tx.push(Request::BeginTx { tx_id: 2 }).unwrap();
@@ -745,6 +750,52 @@ mod tests {
         match resp_rx.pop().unwrap() {
             Response::Nodes(nodes) => assert_eq!(nodes.len(), 1),
             other => panic!("expected Nodes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn event_loop_commit_tx_reports_write_conflict() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+
+        let shard = Shard::new(0);
+        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+
+        // Two transactions concurrently active (each begun while the other
+        // is still open) so first-committer-wins applies between them.
+        req_tx.push(Request::BeginTx { tx_id: 1 }).unwrap();
+        el.tick();
+        resp_rx.pop().unwrap();
+        req_tx.push(Request::BeginTx { tx_id: 2 }).unwrap();
+        el.tick();
+        resp_rx.pop().unwrap();
+
+        // Inject overlapping writes directly (same-crate field access): this
+        // test exercises the CommitTx → CommitResult response plumbing, not
+        // the recording itself (shard.rs's own tests cover real-mutation
+        // write sets via log_page_write).
+        el.shard.tx_mgr.record_write(1, 1, 1, 0);
+        el.shard.tx_mgr.record_write(2, 1, 1, 0);
+
+        // First committer wins.
+        req_tx.push(Request::CommitTx { tx_id: 1 }).unwrap();
+        el.tick();
+        assert!(matches!(
+            resp_rx.pop().unwrap(),
+            Response::CommitResult(Ok(()))
+        ));
+
+        // Second committer's conflict must come back over the SPSC path.
+        req_tx.push(Request::CommitTx { tx_id: 2 }).unwrap();
+        el.tick();
+        match resp_rx.pop().unwrap() {
+            Response::CommitResult(Err(e)) => {
+                assert!(e.contains("conflict"), "unexpected error text: {e}");
+            }
+            other => panic!("expected CommitResult(Err(_)), got {other:?}"),
         }
     }
 
@@ -840,7 +891,7 @@ mod tests {
 
         req_tx.push(Request::CommitTx { tx_id: 1 }).unwrap();
         el.tick();
-        resp_rx.pop(); // Done
+        resp_rx.pop(); // CommitResult
 
         // poll_replication should have drained repl_log into sender, which
         // fans the resulting batch out to the registered replica's outbox.

@@ -1,149 +1,142 @@
 ## Context
 
-graft (Rust graph database) had a multi-agent code review of its Phase 8f
-replication network transport that found 15 confirmed bugs, ranked by
-severity, in `tasks/code-review-findings.md`. The fix pass was split into 3
-milestones by root cause, tracked in `tasks/todo.md`.
+graft (Rust graph database, /Users/jaime/Documents/graph) is getting real
+write-conflict detection: (1) Shard mutation methods must call
+`TransactionManager::record_write()` so first-committer-wins conflict
+detection can actually trigger; (2) a losing commit must be reported to
+wire-protocol clients as an error, not success. Plan: 4 milestones by root
+cause in `tasks/todo.md` (TOP section, "Write-Conflict Detection — Plan").
+Read that plan first — it has full design detail and per-milestone result
+sections.
 
-## Current State — TASK COMPLETE
+## Current State
 
-**All 3 milestones are done. All 15 findings are fixed.** There is no
-remaining work on this task.
+**Milestones 1, 2 AND 3 are DONE and verified** (319 tests passing = 313
+after M2 + 6 from M3; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo fmt --check` clean; wire_protocol tests re-run 3x stable).
+NOT committed to git — all changes are working-tree only (the user hasn't
+asked for a commit). Baseline main is at c1b91ee.
 
-- Milestone 1 (findings #1, #3, #4, #5, #10, #11, #12, #14, #15 — network
-  transport & delivery reliability): done.
-- Milestone 2 (findings #2, #6 — LSN persistence + corrupted-batch
-  handling): done.
-- Milestone 3 (findings #7, #8, #9, #13 — MVCC/tx-counter correctness on
-  replicas): done. Deleted the unsound `sync_tx_counter()`/`GetNextTxId`
-  mechanism entirely, replaced with a structurally collision-free design:
-  replica clusters (`ShardCluster::new_replica`/`open_replica` in
-  `crates/graft-runtime/src/cluster.rs`) seed their `next_tx_id` counter
-  from `REPLICA_TX_ID_BASE = 1 << 63` — a range real primary tx_ids can
-  never reach — instead of syncing to shard-level state. Also fixed
-  `Shard::commit_current_tx()` (`crates/graft-runtime/src/shard.rs`) to
-  ship a replication Abort (not Commit) when `tx_mgr.commit()` reports a
-  `WriteConflict`.
+**The literal task ask is now fully delivered end-to-end**: write sets are
+recorded through real mutation paths (M2), commit results surface to wire
+clients (M1), and two transactions can actually be concurrently active
+through the server so conflicts really trigger (M3). A losing COMMIT_TX
+comes back as a wire ERROR ("commit failed: transaction conflict: ...") and
+the loser is aborted; the winner's data persists.
 
-Full detail on all 3 milestones (design rationale, deviations from earlier
-suggestions with reasoning, discovered-but-out-of-scope gaps) is in
-`tasks/todo.md`'s per-milestone "result" sections — read that before
-re-litigating any design choice. Also see these memory files for
-session-level summaries:
-- `/Users/jaime/.claude/projects/-Users-jaime-Documents-graph/memory/project_repl_review_fixes_milestone1.md`
-- `/Users/jaime/.claude/projects/-Users-jaime-Documents-graph/memory/project_repl_review_fixes_milestone2.md`
-- `/Users/jaime/.claude/projects/-Users-jaime-Documents-graph/memory/project_repl_review_fixes_milestone3.md`
+M1 (done): commit results surface end-to-end. Details in todo.md
+"Milestone 1 — result".
 
-**Verification (last run 2026-07-09, all clean)**:
-- `cargo test --workspace`: 306 tests passing, 0 failed (299 baseline + 7
-  new regression tests added in Milestone 3; Milestones 1-2 added their own
-  on top of the original 278).
-- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-- `cargo fmt --check`: clean.
-- `graft-server` tests re-run 5x total (3x full crate, 2x the new
-  timing-sensitive integration test in isolation): stable, no flakiness.
+M2 (done): write sets recorded via `Shard::log_page_write()` choke point;
+conflict key `(u8 page_type, PageId, u16 slot)`. Details in todo.md
+"Milestone 2 — result".
 
-**Committed to git.** All changes across all 3 milestones (spanning
-`crates/graft-core`, `graft-io`, `graft-query`, `graft-repl`,
-`graft-runtime`, `graft-server`, `graft-storage`, plus two new files —
-`crates/graft-repl/src/registry.rs` and `crates/graft-server/src/identity.rs`
-— and `CLAUDE.md`, `tasks/`, this file) were committed to `main` as
-`860b0b2` on 2026-07-09 at the user's explicit request, with a small
-follow-up doc commit after. The user noted the untested Linux-only
-`graft-io/src/uring.rs` change is acceptable for now ("not worried about a
-macOS version" — i.e. macOS is only the dev box; verify on Linux
-eventually).
+M3 (done, this session): concurrent explicit transactions at the cluster.
+- `crates/graft-runtime/src/cluster.rs`: `begin_explicit_tx()` dropped
+  `assert!(!self.in_explicit_tx)` and no longer sets persistent state;
+  `commit_explicit_tx(tx_id)`, `abort_explicit_tx(tx_id)`,
+  `query_in_tx(tx_id, gql)` are tx_id-parameterized. The
+  `current_tx`/`in_explicit_tx` fields REMAIN but are now transient
+  per-call executor context: `query_in_tx` sets them just before
+  `executor::execute()` and clears them right after (both Ok/Err paths);
+  always 0/false between public calls (auto-commit's commit_tx/abort_tx
+  reset current_tx; execute() always ends in one of them). Field doc
+  comments explain this. Auto-commit `begin_tx()` therefore always
+  allocates a fresh tx — the old silent JOIN of an open explicit tx is
+  gone.
+- Shard side needed ZERO changes — event_loop.rs's CommitTx/AbortTx arms
+  were already tx_id-parameterized (set_active_tx(tx_id) first), and
+  TransactionManager already tracks N active txs.
+- `crates/graft-server/src/main.rs`: CommitTx/RollbackTx use
+  `let Some(tx_id) = active_tx.take() else { ... }` (state cleared up
+  front — tx is over either way); Query passes the connection's tx_id;
+  orphan-abort on disconnect passes tx_id.
+- `crates/graft-server/tests/wire_protocol.rs`: harness mirrors main.rs;
+  3 new end-to-end tests over two real client connections
+  (two_connections_begin_concurrently_without_panic,
+  conflicting_commits_loser_gets_error_winner_persists,
+  auto_commit_on_other_connection_does_not_join_explicit_tx).
+- `crates/graft-runtime/src/cluster.rs` tests: 7 existing call sites
+  updated to new signatures; 3 new tests (conflicting SETs second
+  committer loses + winner value persists, disjoint writes both commit,
+  auto-commit doesn't join open explicit tx).
+- `crates/graft-server/tests/replication.rs`: one
+  `abort_explicit_tx(replica_tx_id)` call site updated.
+- CLAUDE.md Transaction Model bullets updated; todo.md M3 checklist +
+  result written; memory file project_write_conflict_m3.md added;
+  lessons.md gained a "winner writes last" test-design entry.
 
 ## Remaining Work
 
-None on this task. If resumed, the natural next steps are:
-1. Move on to the next roadmap item per `CLAUDE.md`'s phase list (item 19):
-   semi-sync/sync replication (Phase 8f-durability), snapshot shipping
-   (Phase 8g), or automatic failover (Phase 8h).
-2. Two out-of-scope gaps were discovered and explicitly flagged (not part
-   of the 15 findings, not fixed) — see `tasks/todo.md`'s Milestone 3
-   result section for full detail:
-   - `Shard` never calls `TransactionManager::record_write()` from any
-     mutation method, so write-write conflict detection (`WriteConflict`)
-     can't actually trigger through any real code path today — a
-     separate, larger feature.
-   - `commit_current_tx()`'s `WriteConflict` result still isn't surfaced
-     to wire-protocol clients (a commit that lost a conflict looks
-     identical to a client as a real commit).
-   - (Forward-looking, not a bug today) If Phase 8h ever implements real
-     `PROMOTE REPLICA` (currently a stub in `graft-server/src/admin.rs`),
-     chained replication could reintroduce a tx_id collision surface
-     between two clusters that both start their `REPLICA_TX_ID_BASE`
-     counter at the same value — flagged for whoever builds that phase.
+1. **Milestone 4 — cross-shard commit atomicity (FLAGGED — DO NOT BUILD
+   without orchestrator/human scope confirmation)**: a multi-shard tx that
+   conflicts on one shard aborts there but commits on the others — the
+   client gets an error while the non-conflicting shards' writes are
+   visible. Fix sketch (todo.md Milestone 4 section): two-phase commit
+   under the coordinator mutex — extract the conflict-check loop into
+   `TransactionManager::validate(tx_id)`, add `Request::PrepareCommit`
+   fan-out, then CommitTx-all or AbortTx-all. This is adjacent scope
+   beyond the literal task ask. The gap is documented in
+   `commit_explicit_tx()`'s doc comment and pre-announced in CLAUDE.md.
+   If the orchestrator declines M4, the task is DONE as delivered.
 
 ## Key Decisions Already Made (don't re-litigate)
 
-From Milestone 1 — still binding:
-- Per-replica outbox fan-out lives INSIDE `ReplicationSender::poll()`.
-- Replica identity/cluster_id resolved once per process, not per-connect.
-- No read timeout on `primary_reader` (asymmetric with replica's timeout,
-  intentionally).
-- No full WAL-replay catch-up for a reconnecting replica — that's Phase
-  8g, not these 15 findings.
-
-From Milestone 2 — still binding:
-- LSN persistence uses a reservation-ceiling allocator
-  (`REPL_LSN_RESERVE_BATCH = 10_000`), NOT "persist on WAL group-commit
-  cadence".
-- Corrupted-batch handling poisons the `ReplicationReceiver` in-memory and
-  halts forward progress; does NOT force a TCP reconnect. Poisoning does
-  NOT survive a replica process restart (known, accepted gap — Phase 8g's
-  to solve).
-
-From Milestone 3 — still binding:
-- Fixed #7 via disjoint reserved tx_id ranges (`REPLICA_TX_ID_BASE = 1 << 63`
-  in `crates/graft-runtime/src/cluster.rs`), NOT via a larger gap or a
-  snapshot-LSN redesign (the two options raised in the prior handoff) — the
-  disjoint-range approach makes collision structurally impossible rather
-  than merely improbable, and eliminates the sync mechanism entirely rather
-  than narrowing its race window. Full rationale in `tasks/todo.md`.
-- No `is_replica` flag was added to `ShardCluster` — nothing needs to
-  branch on role anymore once construction seeds the right tx_id base.
-- #9's fix ships an explicit Abort record on WriteConflict, NOT silence —
-  shipping nothing would leak the tx_id in `CommitBuffer.pending` forever
-  (`CommitBuffer::append` only resolves a buffered tx on seeing an explicit
-  terminal Commit or Abort record).
+- Milestone ORDER was deliberate: error surfacing (M1) → detection wiring
+  (M2) → the dangerous switch making conflicts triggerable (M3) last.
+- Conflict key is an honest tuple `(u8 page_type, PageId, u16)`.
+- `log_label_write` must NOT record write sets (idempotent label dict).
+- `StorageAccess::commit_tx` uses `Result<(), String>` (keeps graft-query
+  decoupled from graft-core).
+- On commit failure the executor must NOT call `abort_tx()` —
+  `tx_mgr.commit()` already aborted internally and shipped a replication
+  Abort.
+- Cluster commit paths drive ALL shards even when one fails, return first
+  error.
+- M3: transient per-call tx context on ShardCluster (fields kept,
+  semantics changed) instead of threading tx_id through graft-query's
+  StorageAccess trait — reuses executor plumbing unchanged. Per-connection
+  tx state lives with the connection (server's `active_tx`), passed into
+  the tx_id-parameterized cluster methods.
+- Server's "transaction already active" guard on BEGIN is per-connection
+  wire-protocol policy — kept.
+- `Shard.tx_mgr` stays `pub(crate)` (event_loop.rs tests inject write sets
+  to test commit-result plumbing in isolation).
 
 ## Pitfalls to Avoid
 
-- `graft-server` has no `[lib]` target — integration tests under `tests/`
-  can't reach its private modules. Use `#[cfg(test)] mod tests` inside the
-  relevant `src/*.rs` file instead.
-- Before assuming a `cargo clippy -- -D warnings` failure is your fault,
-  `git stash && cargo clippy ... && git stash pop` to check if it pre-dates
-  your change (has been true before — toolchain drift).
-- `crates/graft-io/src/uring.rs`'s `is_data_file()` opens anything not
-  named `*.wal` or `*.meta` with O_DIRECT on Linux — check this function
-  before adding any new small/unaligned persisted file. This dev machine is
-  macOS, so `uring.rs` (`#[cfg(target_os = "linux")]`-gated) can only be
-  verified by reading, not compiling/running — flag any changes there
-  explicitly.
-- RefCell field borrows in `Shard`'s methods don't compose across method
-  calls even for disjoint fields — a function-scoped (not block-scoped)
-  `self.wal.as_ref().map(|w| w.borrow_mut())` needs an explicit `drop()`
-  before calling another `&mut self` method. Full explanation in
-  `tasks/lessons.md`.
-- A TOCTOU race can sometimes be eliminated by construction (disjoint
-  reserved value ranges) instead of narrowed by more careful
-  synchronization — check whether the two racing things actually need to
-  share a value space before reaching for "add more syncing." Full
-  writeup in `tasks/lessons.md`.
-- A regression test can validate a fix's logic even when the bug's
-  real-world trigger path doesn't exist yet in the codebase (e.g. calling
-  a private lower-level method directly from a same-module test to
-  construct the precondition) — say so explicitly rather than skipping
-  coverage or expanding scope to build the missing trigger path. Full
-  writeup in `tasks/lessons.md`.
+- All of tasks/lessons.md still applies. Highlights: graft-server has no
+  lib target (integration tests in tests/, no src unit tests exposed);
+  check clippy failures against main via git stash before assuming they're
+  yours; any new persisted file needs a `.wal`/`.meta` extension or
+  `is_data_file()` in crates/graft-io/src/uring.rs grows a case; RefCell
+  function-scoped borrows need explicit drop() before &mut self helper
+  calls; broad replace_all edits FIRST, targeted exceptions second.
+- NEW (M3): conflict tests that assert post-conflict VALUES must order
+  writes so the WINNER writes last — property records are overwritten in
+  place with no MVCC versioning (pre-existing gap, out of scope), so the
+  loser's physical bytes would otherwise be what a read returns even
+  though its commit correctly errored. Commit Ok/Err assertions are
+  ordering-independent.
+- Replica clusters seed `next_tx_id` at `REPLICA_TX_ID_BASE = 1 << 63`
+  (disjoint tx-id ranges by construction) — M3 preserved this; don't break
+  it in any M4 rework of commit paths.
+- Pre-existing adjacent gap, NOT part of this task: property records carry
+  no tx_min/tx_max (see above). Flag, don't fix.
 
 ## Verification
 
 ```
-cargo test --workspace          # expect 306 passed, 0 failed
+cd /Users/jaime/Documents/graph
+cargo test --workspace          # expect 319 passed, 0 failed (24 suites)
 cargo clippy --workspace --all-targets -- -D warnings   # expect clean
-cargo fmt --check                # expect clean
+cargo fmt --check               # expect clean
 ```
+
+`git status --short` shows exactly these uncommitted modifications (expected
+— M1+M2+M3 are not committed; user hasn't asked): CLAUDE.md, continue.txt,
+crates/graft-query/src/executor.rs, crates/graft-runtime/benches/
+{persistence,query}.rs, crates/graft-runtime/src/{cluster,database,
+event_loop,shard}.rs, crates/graft-server/src/main.rs,
+crates/graft-server/tests/{replication,wire_protocol}.rs,
+crates/graft-txn/src/transaction.rs, tasks/{lessons,todo}.md.

@@ -137,7 +137,11 @@ pub struct Shard {
     next_prop_page_id: PageId,
 
     // MVCC transaction state
-    tx_mgr: TransactionManager,
+    /// pub(crate) so same-crate tests (event_loop.rs, cluster.rs) can inject
+    /// write sets via `record_write()` directly when they exercise the
+    /// commit-result plumbing in isolation. Real write sets are recorded by
+    /// `log_page_write()`, which every record mutation funnels through.
+    pub(crate) tx_mgr: TransactionManager,
     current_tx: TxId,
     current_snapshot: Option<Snapshot>,
     next_local_tx: TxId,
@@ -1074,6 +1078,16 @@ impl Shard {
         data: &[u8; RECORD_SIZE],
         page_type: u8,
     ) {
+        // First-committer-wins conflict detection: every real record write
+        // (write_node_record / write_edge_record / write_prop_record) funnels
+        // through here, so this is the single choke point for recording the
+        // transaction's write set. `page_type` is part of the key because
+        // node/edge/prop files have independent page-id namespaces. No-op
+        // when current_tx isn't active (legacy tx-0 paths). Recovery replay
+        // and replica apply never reach this — they write through
+        // write_record_to_pool / write_record_to_pool_inline directly.
+        self.tx_mgr
+            .record_write(self.current_tx, page_type, page_id, slot);
         let body = WalBody::PageWrite {
             page_id,
             slot,
@@ -1101,6 +1115,11 @@ impl Shard {
     }
 
     /// Log a label creation to the WAL (and replication log if enabled).
+    ///
+    /// Deliberately does NOT record a write set entry: label records use a
+    /// synthetic (page 0, slot 0) key, and `LabelDictionary::get_or_insert`
+    /// is idempotent — recording would make every label creation
+    /// false-conflict with every concurrent label creation.
     fn log_label_write(&mut self, id: LabelId, name: &str) {
         let mut data = [0u8; RECORD_SIZE];
         LabelDictionary::write_label_record(id, name, &mut data);
@@ -1163,16 +1182,16 @@ impl Shard {
     ///
     /// `tx_mgr.commit()` can fail with `WriteConflict` (first-committer-wins);
     /// on failure the transaction was already internally aborted (its Abort
-    /// record is in the *local* WAL). The `Result` is intentionally not
-    /// surfaced to the caller here — event_loop.rs's `Request::CommitTx`
-    /// handler and the auto-commit/explicit-tx callers in cluster.rs all
-    /// treat every commit as unconditionally successful today. That's a
-    /// separate, pre-existing gap (a client is never told its commit lost a
-    /// conflict) outside this fix's scope; what this function *does* handle
-    /// correctly is not shipping a false `Commit` to replicas (see below).
-    pub fn commit_current_tx(&mut self) {
+    /// record is in the *local* WAL, and an Abort — not a Commit — is shipped
+    /// to replicas, see below), so the caller must NOT abort again — just
+    /// propagate the error. The `Result` is surfaced all the way to
+    /// wire-protocol clients: event_loop.rs's `Request::CommitTx` handler
+    /// answers `Response::CommitResult`, cluster.rs's commit paths collect
+    /// per-shard results, and graft-server sends an ERROR message for a
+    /// failed COMMIT.
+    pub fn commit_current_tx(&mut self) -> graft_core::Result<()> {
         if self.current_tx == 0 {
-            return;
+            return Ok(());
         }
         let tx_id = self.current_tx;
 
@@ -1228,6 +1247,8 @@ impl Shard {
                 self.commits_since_sync = 0;
             }
         }
+
+        commit_result
     }
 
     /// Switch the shard's active transaction context to an already-begun tx.
@@ -1817,8 +1838,8 @@ impl StorageAccess for Shard {
         tx_id
     }
 
-    fn commit_tx(&mut self) {
-        self.commit_current_tx();
+    fn commit_tx(&mut self) -> Result<(), String> {
+        self.commit_current_tx().map_err(|e| e.to_string())
     }
 
     fn abort_tx(&mut self) {
@@ -2152,7 +2173,7 @@ mod tests {
         assert!(shard.get_node(id).is_some());
         assert_eq!(shard.scan_nodes(Some("X")).len(), 1);
         assert_eq!(shard.node_property(id, "v"), Value::Int(1));
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
     }
 
     #[test]
@@ -2163,7 +2184,7 @@ mod tests {
         // Create a node in tx 1, commit it
         shard.begin_tx();
         shard.create_node(Some("A"), &[]);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
 
         // Create another node in tx 2, abort it
         shard.begin_tx();
@@ -2175,7 +2196,7 @@ mod tests {
         assert_eq!(shard.scan_nodes(None).len(), 1);
         assert_eq!(shard.scan_nodes(Some("A")).len(), 1);
         assert!(shard.get_node(aborted_id).is_none());
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
     }
 
     #[test]
@@ -2185,18 +2206,18 @@ mod tests {
         // Create and commit a node
         shard.begin_tx();
         let id = shard.create_node(Some("X"), &[]);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
 
         // Delete in a new tx, then commit
         shard.begin_tx();
         shard.delete_node(id);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
 
         // After commit, deleted node should be invisible
         shard.begin_tx();
         assert!(shard.get_node(id).is_none());
         assert_eq!(shard.scan_nodes(None).len(), 0);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
     }
 
     #[test]
@@ -2211,19 +2232,19 @@ mod tests {
         let c = shard.create_node(Some("N"), &[]);
         let e1 = shard.create_edge(a, b, Some("E"), &[]);
         shard.create_edge(a, c, Some("E"), &[]);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
 
         // Delete e1 (the second edge in the chain, since e2 was prepended)
         shard.begin_tx();
         shard.delete_edge(e1);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
 
         // Traversal should still find the remaining edge
         shard.begin_tx();
         let out = shard.outbound_edges(a, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].target, c);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
     }
 
     #[test]
@@ -2233,12 +2254,12 @@ mod tests {
 
         shard.begin_tx();
         let id = shard.create_node(Some("X"), &[("v".into(), Value::Int(42))]);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
 
         shard.begin_tx();
         assert!(shard.get_node(id).is_some());
         assert_eq!(shard.node_property(id, "v"), Value::Int(42));
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
     }
 
     #[test]
@@ -2259,7 +2280,7 @@ mod tests {
 
             shard.begin_tx();
             id = shard.create_node(Some("X"), &[("v".into(), Value::Int(42))]);
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
 
             // Flush WAL only, not dirty pages
             if let Some(ref wal) = shard.wal {
@@ -2284,7 +2305,7 @@ mod tests {
             let nodes = shard.scan_nodes(Some("X"));
             assert_eq!(nodes.len(), 1);
             assert_eq!(shard.node_property(id, "v"), Value::Int(42));
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
         }
     }
 
@@ -2333,7 +2354,7 @@ mod tests {
                 0,
                 "uncommitted writes should not survive recovery"
             );
-            shard.commit_tx();
+            shard.commit_tx().unwrap();
         }
     }
 
@@ -2342,7 +2363,7 @@ mod tests {
         let mut shard = Shard::new(0);
         shard.begin_tx();
         shard.create_node(Some("N"), &[]);
-        shard.commit_tx();
+        shard.commit_tx().unwrap();
         assert!(shard.drain_repl_log().is_empty());
     }
 
@@ -2353,7 +2374,7 @@ mod tests {
 
         shard.begin_tx_with_id(1);
         shard.create_node(Some("N"), &[("k".into(), Value::Int(1))]);
-        shard.commit_current_tx();
+        shard.commit_current_tx().unwrap();
 
         let log = shard.drain_repl_log();
         // Begin + node write + prop write + label write + Commit
@@ -2394,7 +2415,7 @@ mod tests {
 
         shard.begin_tx_with_id(1);
         shard.create_node(Some("N"), &[]);
-        shard.commit_current_tx();
+        shard.commit_current_tx().unwrap();
 
         let log1 = shard.drain_repl_log();
         assert!(!log1.is_empty());
@@ -2420,7 +2441,7 @@ mod tests {
         .unwrap();
         shard.enable_replication();
         shard.begin_tx_with_id(1);
-        shard.commit_current_tx();
+        shard.commit_current_tx().unwrap();
         let log = shard.drain_repl_log();
         assert_eq!(log[0].lsn, 1, "first-ever LSN on a fresh shard is 1");
     }
@@ -2439,7 +2460,7 @@ mod tests {
             shard.enable_replication();
             shard.begin_tx_with_id(1);
             shard.create_node(Some("N"), &[]);
-            shard.commit_current_tx();
+            shard.commit_current_tx().unwrap();
             let log = shard.drain_repl_log();
             last_lsn_before_restart = log.last().unwrap().lsn;
             // Dropped here — simulates the primary process exiting. No
@@ -2452,7 +2473,7 @@ mod tests {
         let mut shard = Shard::open(0, &config).unwrap();
         shard.enable_replication();
         shard.begin_tx_with_id(2);
-        shard.commit_current_tx();
+        shard.commit_current_tx().unwrap();
         let log = shard.drain_repl_log();
         let first_lsn_after_restart = log[0].lsn;
 
@@ -2486,14 +2507,14 @@ mod tests {
             for i in 0..50u64 {
                 shard.begin_tx_with_id(i + 1);
                 shard.create_node(Some("N"), &[]);
-                shard.commit_current_tx();
+                shard.commit_current_tx().unwrap();
             }
             shard.drain_repl_log();
         }
         let mut shard = Shard::open(0, &config).unwrap();
         shard.enable_replication();
         shard.begin_tx_with_id(1000);
-        shard.commit_current_tx();
+        shard.commit_current_tx().unwrap();
         let log = shard.drain_repl_log();
         // Still resumes from the first reserved batch's ceiling, not from
         // ~150 (50 txs * ~3 records each) — confirming one reservation
@@ -2505,54 +2526,64 @@ mod tests {
     // internally aborted (WriteConflict, first-committer-wins) must never
     // be shipped to replicas as a Commit. -----------------------------------
     //
-    // Shard doesn't currently call TransactionManager::record_write() from
-    // any of its mutation methods, so a real WriteConflict can't yet occur
-    // through Shard's own public API — these tests provoke one by calling
-    // tx_mgr.record_write() directly (legal: same-module private field
-    // access), simulating what real write-conflict-tracking wiring would
-    // eventually produce.
+    // The conflict is provoked through Shard's real mutation API: two
+    // concurrently-active transactions both rewrite the same property
+    // record, so `log_page_write()` records overlapping write sets.
 
     #[test]
     fn commit_write_conflict_ships_abort_not_commit() {
         let mut shard = Shard::new(0);
         shard.enable_replication();
 
-        // tx1 and tx2 both begin while the other is still active, so each
+        // Setup tx: create the contended node + property, committed so both
+        // later snapshots see it.
+        shard.begin_tx_with_id(1);
+        let id = shard.create_node(Some("N"), &[("x".into(), Value::Int(0))]);
+        shard.commit_current_tx().unwrap();
+
+        // tx2 and tx3 both begin while the other is still active, so each
         // one's snapshot treats the other as concurrent (required for
         // first-committer-wins to actually flag a conflict — see
         // graft-txn's `first_committer_wins` test for the same pattern).
-        shard.begin_tx_with_id(1);
-        shard.set_active_tx(0);
         shard.begin_tx_with_id(2);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(3);
 
-        // Both write to the same (page_id, slot).
-        shard.tx_mgr.record_write(1, 1, 0);
-        shard.tx_mgr.record_write(2, 1, 0);
-
-        // tx1 commits first — succeeds, ships a real Commit.
-        shard.set_active_tx(1);
-        shard.commit_current_tx();
-
-        // tx2 commits second — first-committer-wins conflict, internally
-        // aborted by tx_mgr.commit(). Must ship an Abort, not a Commit.
+        // Both rewrite the same property record (same prop page + slot).
         shard.set_active_tx(2);
-        shard.commit_current_tx();
+        shard.set_node_property(id, "x", &Value::Int(2));
+        shard.set_active_tx(3);
+        shard.set_node_property(id, "x", &Value::Int(3));
+
+        // tx2 commits first — succeeds, ships a real Commit.
+        shard.set_active_tx(2);
+        shard.commit_current_tx().unwrap();
+
+        // tx3 commits second — first-committer-wins conflict, internally
+        // aborted by tx_mgr.commit(). Must ship an Abort, not a Commit —
+        // and the conflict must be surfaced to the caller.
+        shard.set_active_tx(3);
+        let result = shard.commit_current_tx();
+        assert!(
+            matches!(result, Err(graft_core::Error::WriteConflict(_))),
+            "losing commit must surface WriteConflict, got {result:?}"
+        );
 
         let log = shard.drain_repl_log();
-        let tx1_records: Vec<_> = log.iter().filter(|r| r.tx_id == 1).collect();
         let tx2_records: Vec<_> = log.iter().filter(|r| r.tx_id == 2).collect();
+        let tx3_records: Vec<_> = log.iter().filter(|r| r.tx_id == 3).collect();
 
         assert_eq!(
-            tx1_records.last().unwrap().record_type,
+            tx2_records.last().unwrap().record_type,
             WalRecordType::Commit
         );
         assert_eq!(
-            tx2_records.last().unwrap().record_type,
+            tx3_records.last().unwrap().record_type,
             WalRecordType::Abort,
             "a WriteConflict-aborted transaction must ship Abort, not Commit"
         );
         assert!(
-            tx2_records
+            tx3_records
                 .iter()
                 .all(|r| r.record_type != WalRecordType::Commit),
             "no record for the conflicting tx may claim Commit"
@@ -2568,15 +2599,23 @@ mod tests {
         let mut shard = Shard::new(0);
         shard.enable_replication();
 
+        // Committed setup tx creates the contended node + property.
         shard.begin_tx_with_id(1);
-        shard.set_active_tx(0);
+        let id = shard.create_node(Some("N"), &[("x".into(), Value::Int(0))]);
+        shard.commit_current_tx().unwrap();
+
+        // Two concurrent txs both rewrite the same property record.
         shard.begin_tx_with_id(2);
-        shard.tx_mgr.record_write(1, 1, 0);
-        shard.tx_mgr.record_write(2, 1, 0);
-        shard.set_active_tx(1);
-        shard.commit_current_tx();
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(3);
         shard.set_active_tx(2);
-        shard.commit_current_tx();
+        shard.set_node_property(id, "x", &Value::Int(2));
+        shard.set_active_tx(3);
+        shard.set_node_property(id, "x", &Value::Int(3));
+        shard.set_active_tx(2);
+        shard.commit_current_tx().unwrap();
+        shard.set_active_tx(3);
+        shard.commit_current_tx().unwrap_err();
 
         let log = shard.drain_repl_log();
 
@@ -2593,6 +2632,128 @@ mod tests {
         );
 
         let batches = sender.drain_outbound();
-        assert_eq!(batches.len(), 1, "only tx1's real commit should ship");
+        assert_eq!(batches.len(), 1, "all ready records ship in one batch");
+        let shipped = graft_repl::receiver::deserialize_wal_records(&batches[0].records).unwrap();
+        assert!(
+            shipped.iter().all(|r| r.tx_id != 3),
+            "no record of the conflicting tx may ship as committed data"
+        );
+    }
+
+    // -- Write-set recording through real mutation paths (Milestone 2 of the
+    // write-conflict plan): log_page_write() records every record write in
+    // the active tx's write set, so first-committer-wins actually triggers
+    // through Shard's public mutation API. --------------------------------
+
+    #[test]
+    fn real_mutation_write_conflict_second_committer_loses() {
+        let mut shard = Shard::new(0);
+        // Created outside any tx (legacy tx-0 path): pre-MVCC record,
+        // visible to every snapshot; record_write no-ops for tx 0.
+        let id = shard.create_node(Some("N"), &[("x".into(), Value::Int(0))]);
+
+        // Two concurrently-active transactions.
+        shard.begin_tx_with_id(1);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(2);
+
+        // Both rewrite the same property record (same prop page + slot).
+        shard.set_active_tx(1);
+        shard.set_node_property(id, "x", &Value::Int(1));
+        shard.set_active_tx(2);
+        shard.set_node_property(id, "x", &Value::Int(2));
+
+        shard.set_active_tx(1);
+        shard.commit_current_tx().unwrap();
+        shard.set_active_tx(2);
+        let result = shard.commit_current_tx();
+        assert!(
+            matches!(result, Err(graft_core::Error::WriteConflict(_))),
+            "second committer must lose first-committer-wins, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn real_mutation_disjoint_writes_both_commit() {
+        let mut shard = Shard::new(0);
+        let a = shard.create_node(Some("N"), &[("x".into(), Value::Int(0))]);
+        let b = shard.create_node(Some("N"), &[("x".into(), Value::Int(0))]);
+
+        shard.begin_tx_with_id(1);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(2);
+
+        // Different nodes → different property record slots → disjoint.
+        shard.set_active_tx(1);
+        shard.set_node_property(a, "x", &Value::Int(1));
+        shard.set_active_tx(2);
+        shard.set_node_property(b, "x", &Value::Int(2));
+
+        shard.set_active_tx(1);
+        shard.commit_current_tx().unwrap();
+        shard.set_active_tx(2);
+        shard.commit_current_tx().unwrap();
+    }
+
+    #[test]
+    fn node_and_edge_page_namespaces_do_not_false_conflict() {
+        // Node/edge/prop files have independent page-id allocation counters,
+        // so node page 0 slot 0 and edge page 0 slot 0 are DIFFERENT records.
+        // Without the page_type discriminant in the write-set key these two
+        // transactions would false-conflict on (page 0, slot 0).
+        let mut shard = Shard::new(0);
+        let n1 = shard.create_node(Some("N"), &[]); // node page 0, slot 0
+        let n2 = shard.create_node(Some("N"), &[]); // node page 0, slot 1
+        let n3 = shard.create_node(Some("N"), &[]); // node page 0, slot 2
+
+        shard.begin_tx_with_id(1);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(2);
+
+        // tx1 rewrites n1's node record (node page 0, slot 0).
+        shard.set_active_tx(1);
+        shard.delete_node(n1);
+        // tx2 writes the first edge record (edge page 0, slot 0) plus n2/n3
+        // head-pointer updates (node page 0, slots 1 and 2) — all disjoint
+        // from tx1's write.
+        shard.set_active_tx(2);
+        shard.create_edge(n2, n3, None, &[]);
+
+        shard.set_active_tx(1);
+        shard.commit_current_tx().unwrap();
+        shard.set_active_tx(2);
+        shard
+            .commit_current_tx()
+            .expect("node page 0 and edge page 0 are different records — no conflict");
+    }
+
+    #[test]
+    fn concurrent_edges_from_same_source_conflict_on_head_pointer() {
+        // create_edge rewrites the source node's record to update its
+        // first_out_edge head pointer — two concurrent transactions adding
+        // edges from the same source both write that node record, so the
+        // second committer must lose.
+        let mut shard = Shard::new(0);
+        let src = shard.create_node(Some("N"), &[]);
+        let t1 = shard.create_node(Some("N"), &[]);
+        let t2 = shard.create_node(Some("N"), &[]);
+
+        shard.begin_tx_with_id(1);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(2);
+
+        shard.set_active_tx(1);
+        shard.create_edge(src, t1, None, &[]);
+        shard.set_active_tx(2);
+        shard.create_edge(src, t2, None, &[]);
+
+        shard.set_active_tx(1);
+        shard.commit_current_tx().unwrap();
+        shard.set_active_tx(2);
+        let result = shard.commit_current_tx();
+        assert!(
+            matches!(result, Err(graft_core::Error::WriteConflict(_))),
+            "concurrent head-pointer updates on the same source node must conflict, got {result:?}"
+        );
     }
 }

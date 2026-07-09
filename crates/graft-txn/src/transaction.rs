@@ -21,8 +21,11 @@ pub struct Transaction {
     pub tx_id: TxId,
     pub snapshot: Snapshot,
     pub status: TxStatus,
-    /// Set of (page_id, slot) pairs this transaction has written.
-    write_set: Vec<(PageId, u16)>,
+    /// Set of (page_type, page_id, slot) triples this transaction has
+    /// written. `page_type` discriminates the independent node/edge/prop
+    /// page-id namespaces (each pool has its own allocation counter) —
+    /// without it, node page N would false-conflict with edge page N.
+    write_set: Vec<(u8, PageId, u16)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,10 +43,10 @@ pub struct TransactionManager {
     /// is treated as committed (survived recovery).
     base_tx_id: TxId,
     active: HashMap<TxId, Transaction>,
-    /// For conflict detection: maps `(page_id, slot)` to the TxId that last
-    /// committed a write. Entries older than the oldest active snapshot can
-    /// be pruned.
-    committed_writes: HashMap<(PageId, u16), TxId>,
+    /// For conflict detection: maps `(page_type, page_id, slot)` to the TxId
+    /// that last committed a write. Entries older than the oldest active
+    /// snapshot can be pruned.
+    committed_writes: HashMap<(u8, PageId, u16), TxId>,
     /// Committed TxIds (for MVCC visibility). Bounded: we prune below the
     /// low-water mark.
     committed_set: HashSet<TxId>,
@@ -97,11 +100,13 @@ impl TransactionManager {
         tx_id
     }
 
-    /// Record that a transaction wrote to `(page_id, slot)`.
-    /// Call this before modifying the page so the WAL has the entry.
-    pub fn record_write(&mut self, tx_id: TxId, page_id: PageId, slot: u16) {
+    /// Record that a transaction wrote to `(page_type, page_id, slot)`.
+    /// `page_type` is required because node/edge/prop pools have independent
+    /// page-id namespaces — see the `write_set` field doc. No-op when
+    /// `tx_id` isn't an active transaction (e.g. the legacy tx-0 path).
+    pub fn record_write(&mut self, tx_id: TxId, page_type: u8, page_id: PageId, slot: u16) {
         if let Some(tx) = self.active.get_mut(&tx_id) {
-            tx.write_set.push((page_id, slot));
+            tx.write_set.push((page_type, page_id, slot));
         }
     }
 
@@ -118,8 +123,8 @@ impl TransactionManager {
         // First-committer-wins: check if any of our writes conflict with
         // a transaction that committed concurrently (i.e. was not visible
         // to our snapshot).
-        for &(page_id, slot) in &tx.write_set {
-            if let Some(&last_writer) = self.committed_writes.get(&(page_id, slot)) {
+        for &(page_type, page_id, slot) in &tx.write_set {
+            if let Some(&last_writer) = self.committed_writes.get(&(page_type, page_id, slot)) {
                 let was_invisible =
                     last_writer >= tx.snapshot.ts || tx.snapshot.active.contains(&last_writer);
                 if was_invisible {
@@ -142,8 +147,9 @@ impl TransactionManager {
 
         // Update bookkeeping
         let tx = self.active.remove(&tx_id).unwrap();
-        for &(page_id, slot) in &tx.write_set {
-            self.committed_writes.insert((page_id, slot), tx_id);
+        for &(page_type, page_id, slot) in &tx.write_set {
+            self.committed_writes
+                .insert((page_type, page_id, slot), tx_id);
         }
         self.committed_set.insert(tx_id);
         self.update_low_water();
@@ -311,8 +317,8 @@ mod tests {
         let tx1 = tm.begin(Some(&mut wal));
         let tx2 = tm.begin(Some(&mut wal));
 
-        tm.record_write(tx1, 1, 0);
-        tm.record_write(tx2, 2, 0); // different page
+        tm.record_write(tx1, 1, 1, 0);
+        tm.record_write(tx2, 1, 2, 0); // different page
 
         tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
         tm.commit(tx2, Some(&mut wal), Some(&mut io)).unwrap(); // no conflict
@@ -325,9 +331,9 @@ mod tests {
         let tx1 = tm.begin(Some(&mut wal));
         let tx2 = tm.begin(Some(&mut wal));
 
-        // Both write to same (page, slot)
-        tm.record_write(tx1, 1, 0);
-        tm.record_write(tx2, 1, 0);
+        // Both write to same (page_type, page, slot)
+        tm.record_write(tx1, 1, 1, 0);
+        tm.record_write(tx2, 1, 1, 0);
 
         // tx1 commits first — succeeds
         tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
@@ -338,17 +344,35 @@ mod tests {
     }
 
     #[test]
+    fn no_conflict_same_page_slot_different_page_type() {
+        // Node/edge/prop files have independent page-id namespaces (separate
+        // allocation counters), so node page N and edge page N are different
+        // physical records. The page_type discriminant in the write-set key
+        // must keep them from false-conflicting.
+        let (mut io, _, mut wal, mut tm) = setup();
+
+        let tx1 = tm.begin(Some(&mut wal));
+        let tx2 = tm.begin(Some(&mut wal));
+
+        tm.record_write(tx1, 1, 1, 0); // node page 1, slot 0
+        tm.record_write(tx2, 2, 1, 0); // edge page 1, slot 0 — different record
+
+        tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
+        tm.commit(tx2, Some(&mut wal), Some(&mut io)).unwrap(); // no conflict
+    }
+
+    #[test]
     fn no_conflict_if_committed_before_snapshot() {
         let (mut io, _, mut wal, mut tm) = setup();
 
         // tx1 writes and commits BEFORE tx2 starts
         let tx1 = tm.begin(Some(&mut wal));
-        tm.record_write(tx1, 1, 0);
+        tm.record_write(tx1, 1, 1, 0);
         tm.commit(tx1, Some(&mut wal), Some(&mut io)).unwrap();
 
         // tx2 starts after tx1 committed — its snapshot includes tx1
         let tx2 = tm.begin(Some(&mut wal));
-        tm.record_write(tx2, 1, 0); // same slot, but tx1 already committed
+        tm.record_write(tx2, 1, 1, 0); // same slot, but tx1 already committed
 
         // No conflict because tx1 committed before tx2's snapshot
         tm.commit(tx2, Some(&mut wal), Some(&mut io)).unwrap();
@@ -360,7 +384,7 @@ mod tests {
 
         for _ in 0..20 {
             let tx = tm.begin(Some(&mut wal));
-            tm.record_write(tx, 1, 0);
+            tm.record_write(tx, 1, 1, 0);
             tm.commit(tx, Some(&mut wal), Some(&mut io)).unwrap();
         }
 

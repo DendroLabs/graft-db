@@ -56,26 +56,35 @@ fn start_test_server_with_shards(shard_count: usize) -> String {
                                 .unwrap();
                         }
                         MessageType::CommitTx => {
-                            {
+                            let tx_id = active_tx.take().expect("COMMIT without BEGIN in test");
+                            let commit_result = {
                                 let mut db = db.lock().unwrap();
-                                db.commit_explicit_tx();
+                                db.commit_explicit_tx(tx_id)
+                            };
+                            match commit_result {
+                                Ok(()) => send_summary(
+                                    &mut writer,
+                                    &SummaryMsg {
+                                        rows_affected: 0,
+                                        elapsed_ms: 0,
+                                    },
+                                )
+                                .unwrap(),
+                                Err(e) => send_error(
+                                    &mut writer,
+                                    &ErrorMsg {
+                                        message: format!("commit failed: {e}"),
+                                    },
+                                )
+                                .unwrap(),
                             }
-                            active_tx = None;
-                            send_summary(
-                                &mut writer,
-                                &SummaryMsg {
-                                    rows_affected: 0,
-                                    elapsed_ms: 0,
-                                },
-                            )
-                            .unwrap();
                         }
                         MessageType::RollbackTx => {
+                            let tx_id = active_tx.take().expect("ROLLBACK without BEGIN in test");
                             {
                                 let mut db = db.lock().unwrap();
-                                db.abort_explicit_tx();
+                                db.abort_explicit_tx(tx_id);
                             }
-                            active_tx = None;
                             send_summary(
                                 &mut writer,
                                 &SummaryMsg {
@@ -89,10 +98,9 @@ fn start_test_server_with_shards(shard_count: usize) -> String {
                             let query_msg: QueryMsg = rmp_serde::from_slice(&payload).unwrap();
                             let result = {
                                 let mut db = db.lock().unwrap();
-                                if active_tx.is_some() {
-                                    db.query_in_tx(&query_msg.text)
-                                } else {
-                                    db.query(&query_msg.text)
+                                match active_tx {
+                                    Some(tx_id) => db.query_in_tx(tx_id, &query_msg.text),
+                                    None => db.query(&query_msg.text),
                                 }
                             };
                             match result {
@@ -136,9 +144,9 @@ fn start_test_server_with_shards(shard_count: usize) -> String {
                 }
 
                 // Abort orphaned tx on disconnect
-                if active_tx.is_some() {
+                if let Some(tx_id) = active_tx {
                     let mut db = db.lock().unwrap();
-                    db.abort_explicit_tx();
+                    db.abort_explicit_tx(tx_id);
                 }
             });
         }
@@ -407,4 +415,91 @@ fn multi_shard_explicit_tx_over_wire() {
 
     let result = client.query("MATCH (n:N) RETURN n.v ORDER BY n.v").unwrap();
     assert_eq!(result.rows.len(), 8);
+}
+
+// -- Milestone 3 regression tests: concurrent explicit transactions over the
+// wire. The coordinator used to have ONE global tx context: a second
+// connection's BEGIN panicked an assert (poisoning the server's cluster
+// mutex, killing every connection), and an auto-commit query during another
+// connection's open explicit tx silently joined it.
+
+#[test]
+fn two_connections_begin_concurrently_without_panic() {
+    let addr = start_test_server();
+    let mut conn_a = graft_client::Client::connect(&addr).unwrap();
+    let mut conn_b = graft_client::Client::connect(&addr).unwrap();
+
+    // Concurrent BEGINs — the second used to panic the coordinator.
+    let tx_a = conn_a.begin_tx().unwrap();
+    let tx_b = conn_b.begin_tx().unwrap();
+    assert_ne!(tx_a, tx_b);
+
+    // Disjoint writes in each tx; both commits succeed.
+    conn_a.query("CREATE (:P {name: 'from_a'})").unwrap();
+    conn_b.query("CREATE (:P {name: 'from_b'})").unwrap();
+    conn_a.commit_tx().unwrap();
+    conn_b.commit_tx().unwrap();
+
+    let result = conn_a
+        .query("MATCH (p:P) RETURN p.name ORDER BY p.name")
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], "from_a");
+    assert_eq!(result.rows[1][0], "from_b");
+}
+
+#[test]
+fn conflicting_commits_loser_gets_error_winner_persists() {
+    let addr = start_test_server();
+    let mut conn_a = graft_client::Client::connect(&addr).unwrap();
+    let mut conn_b = graft_client::Client::connect(&addr).unwrap();
+
+    conn_a.query("CREATE (:N {name: 'x', v: 0})").unwrap();
+
+    conn_a.begin_tx().unwrap();
+    conn_b.begin_tx().unwrap();
+
+    // Both transactions write the same property. Loser (B) writes FIRST,
+    // winner (A) writes LAST: property records are overwritten in place
+    // with no MVCC versioning (pre-existing gap, see Milestone 2's result
+    // in tasks/todo.md), so this ordering keeps the final-value assertion
+    // meaningful.
+    conn_b.query("MATCH (n:N) SET n.v = 2").unwrap();
+    conn_a.query("MATCH (n:N) SET n.v = 1").unwrap();
+
+    // First committer wins; the loser's COMMIT must come back as a wire
+    // ERROR (the client maps it to Err), not success.
+    conn_a.commit_tx().unwrap();
+    let err = conn_b.commit_tx().unwrap_err();
+    assert!(
+        err.to_string().contains("conflict"),
+        "loser's commit error should mention the conflict, got: {err}"
+    );
+
+    // Winner's value persists.
+    let result = conn_a.query("MATCH (n:N) RETURN n.v").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], "1");
+}
+
+#[test]
+fn auto_commit_on_other_connection_does_not_join_explicit_tx() {
+    let addr = start_test_server();
+    let mut conn_a = graft_client::Client::connect(&addr).unwrap();
+    let mut conn_b = graft_client::Client::connect(&addr).unwrap();
+
+    conn_a.begin_tx().unwrap();
+    conn_a.query("CREATE (:T {name: 'ghost'})").unwrap();
+
+    // conn_b's auto-commit query used to silently join conn_a's open tx
+    // (and would then vanish with conn_a's rollback). It must commit
+    // independently.
+    conn_b.query("CREATE (:T {name: 'real'})").unwrap();
+
+    conn_a.rollback_tx().unwrap();
+
+    // conn_b's write survives conn_a's rollback; conn_a's does not.
+    let result = conn_b.query("MATCH (t:T) RETURN t.name").unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], "real");
 }

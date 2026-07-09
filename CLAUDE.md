@@ -62,11 +62,12 @@ crates/
 - `was_committed()` handles both current-session and post-recovery (pre-`base_tx_id`) visibility
 - Per-shard WAL files with 64KB write buffer; WAL records stamped with `current_tx`; group commit (write to OS page cache on commit, fsync every 2ms or 64 commits)
 - Two-pass WAL recovery: pass 1 builds committed tx set, pass 2 replays only committed writes
-- Snapshot isolation with first-committer-wins conflict detection
+- Snapshot isolation with first-committer-wins conflict detection: `Shard::log_page_write()` (the choke point every node/edge/prop record write funnels through) records each write in the tx's write set via `TransactionManager::record_write()`; the conflict key is `(page_type, page_id, slot)` because node/edge/prop files have independent page-id namespaces (label writes deliberately not recorded — idempotent dictionary inserts on a synthetic key); recovery replay and replica apply bypass `log_page_write`, so they never record write sets
 - Edge chain traversal reads raw records for next pointers, checks visibility separately (invisible edges skipped without breaking chain)
-- `StorageAccess` trait has `begin_tx/commit_tx/abort_tx` (default no-ops for backward compat)
+- `StorageAccess` trait has `begin_tx/commit_tx/abort_tx` (default no-ops for backward compat); `commit_tx` returns `Result<(), String>` — a failed commit (e.g. `WriteConflict`) surfaces through executor auto-commit (`ExecutionError::CommitFailed`), `Response::CommitResult`, `ShardCluster::commit_explicit_tx`, and the server's COMMIT_TX handler as a wire ERROR
 - `ShardCluster` generates global tx_id via `AtomicU64`, routes `BeginTx/CommitTx/AbortTx` to all shard workers
-- Explicit `BEGIN`/`COMMIT`/`ROLLBACK` over wire protocol with per-connection tx state, orphaned tx abort on disconnect
+- Concurrent explicit transactions: coordinator methods are tx_id-parameterized (`query_in_tx(tx_id, gql)`, `commit_explicit_tx(tx_id)`, `abort_explicit_tx(tx_id)`) — N transactions can be concurrently active (per-shard `TransactionManager` tracks them; `SetActiveTx` restores context per statement); the cluster's `current_tx`/`in_explicit_tx` are transient per-call executor context, never persistent connection state; auto-commit queries always allocate their own tx (never join an open explicit tx). Known gap (todo.md Milestone 4): no cross-shard prepare phase yet — a multi-shard conflicting tx commits on non-conflicting shards while the client gets the error
+- Explicit `BEGIN`/`COMMIT`/`ROLLBACK` over wire protocol with per-connection tx state (server passes the connection's tx_id into the cluster API), orphaned tx abort on disconnect passes that tx_id
 
 ### Query Engine
 - LALRPOP parser (LR(1), build-time codegen) with hand-written lexer

@@ -169,11 +169,19 @@ impl StorageAccess for Database {
         tx_id
     }
 
-    fn commit_tx(&mut self) {
+    fn commit_tx(&mut self) -> Result<(), String> {
+        // Drive every shard to resolve its side of the transaction even if
+        // one fails; report the first failure.
+        let mut result = Ok(());
         for shard in &mut self.shards {
-            shard.commit_current_tx();
+            if let Err(e) = shard.commit_current_tx() {
+                if result.is_ok() {
+                    result = Err(e.to_string());
+                }
+            }
         }
         self.current_tx = 0;
+        result
     }
 
     fn abort_tx(&mut self) {

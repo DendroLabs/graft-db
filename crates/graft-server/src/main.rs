@@ -269,7 +269,10 @@ fn handle_connection(
                     writer.flush()?;
                 }
                 MessageType::CommitTx => {
-                    if active_tx.is_none() {
+                    // The transaction is over either way after this: on Err
+                    // the conflicting shard(s) already aborted it, so the
+                    // connection's tx state is cleared up front via take().
+                    let Some(tx_id) = active_tx.take() else {
                         send_error(
                             &mut writer,
                             &ErrorMsg {
@@ -278,24 +281,31 @@ fn handle_connection(
                         )?;
                         writer.flush()?;
                         continue;
-                    }
+                    };
                     let start = Instant::now();
-                    {
+                    let commit_result = {
                         let mut db = db.lock().unwrap();
-                        db.commit_explicit_tx();
+                        db.commit_explicit_tx(tx_id)
+                    };
+                    match commit_result {
+                        Ok(()) => send_summary(
+                            &mut writer,
+                            &SummaryMsg {
+                                rows_affected: 0,
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                            },
+                        )?,
+                        Err(e) => send_error(
+                            &mut writer,
+                            &ErrorMsg {
+                                message: format!("commit failed: {e}"),
+                            },
+                        )?,
                     }
-                    active_tx = None;
-                    send_summary(
-                        &mut writer,
-                        &SummaryMsg {
-                            rows_affected: 0,
-                            elapsed_ms: start.elapsed().as_millis() as u64,
-                        },
-                    )?;
                     writer.flush()?;
                 }
                 MessageType::RollbackTx => {
-                    if active_tx.is_none() {
+                    let Some(tx_id) = active_tx.take() else {
                         send_error(
                             &mut writer,
                             &ErrorMsg {
@@ -304,13 +314,12 @@ fn handle_connection(
                         )?;
                         writer.flush()?;
                         continue;
-                    }
+                    };
                     let start = Instant::now();
                     {
                         let mut db = db.lock().unwrap();
-                        db.abort_explicit_tx();
+                        db.abort_explicit_tx(tx_id);
                     }
-                    active_tx = None;
                     send_summary(
                         &mut writer,
                         &SummaryMsg {
@@ -365,10 +374,9 @@ fn handle_connection(
 
                     let result = {
                         let mut db = db.lock().unwrap();
-                        if active_tx.is_some() {
-                            db.query_in_tx(&query_msg.text)
-                        } else {
-                            db.query(&query_msg.text)
+                        match active_tx {
+                            Some(tx_id) => db.query_in_tx(tx_id, &query_msg.text),
+                            None => db.query(&query_msg.text),
                         }
                     };
                     let elapsed = start.elapsed();
@@ -421,10 +429,10 @@ fn handle_connection(
     })();
 
     // On disconnect, abort any orphaned transaction
-    if active_tx.is_some() {
-        tracing::info!("connection {peer} dropped with active tx, aborting");
+    if let Some(tx_id) = active_tx {
+        tracing::info!("connection {peer} dropped with active tx {tx_id}, aborting");
         let mut db = db.lock().unwrap();
-        db.abort_explicit_tx();
+        db.abort_explicit_tx(tx_id);
     }
 
     result

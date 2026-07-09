@@ -1,4 +1,337 @@
-# Phase 8f Replication — Code Review Fix Plan
+# Write-Conflict Detection — Plan (current task)
+
+Task: (1) Shard mutation methods must call `TransactionManager::record_write()`
+so first-committer-wins conflict detection can actually trigger; (2) surface
+`WriteConflict` from `commit_current_tx()` to wire-protocol clients so a losing
+commit is reported as an error, not success. These are the two out-of-scope
+gaps flagged in the previous task's Milestone 3 result (below).
+
+Baseline: 306 tests passing on `main` at c1b91ee (re-verified at task start).
+
+Milestones by root cause. Ordered so the dangerous switch (conflicts actually
+firing) is flipped only after the error-reporting path is already in place.
+
+## Milestone 1 — Surface commit results end-to-end (root cause: every layer discards `commit_current_tx()`'s Result)
+
+The plumbing today: `Shard::commit_current_tx()` returns `()`;
+`event_loop.rs`'s `Request::CommitTx` arm answers `Response::Done`
+unconditionally; `cluster.rs`'s `commit_explicit_tx()` /
+`StorageAccess::commit_tx` return `()`; `executor.rs`'s auto-commit ignores
+`commit_tx()`; `main.rs`'s `CommitTx` handler always sends a success
+`SummaryMsg`. A commit that loses first-committer-wins would be reported as
+success at every one of those layers.
+
+Design:
+- `Shard::commit_current_tx() -> graft_core::Result<()>` — return the
+  already-captured `commit_result` (the replication Commit/Abort branching on
+  it stays exactly as is).
+- `StorageAccess::commit_tx()` (graft-query) → `Result<(), String>`, default
+  `Ok(())`. String keeps graft-query decoupled from graft-core's Error and
+  matches the existing `Result<_, String>` convention in cluster::query and
+  the wire ErrorMsg.
+- `executor::execute()`: on plan success, a failing `commit_tx()` becomes a
+  new `ExecutionError::CommitFailed(String)`. No `abort_tx()` on commit
+  failure — `tx_mgr.commit()` already aborted internally on conflict.
+- `Response::CommitResult(Result<(), String>)` in cluster.rs;
+  `Request::CommitTx` arm in event_loop.rs returns it.
+- `ShardCluster::commit_explicit_tx() -> Result<(), String>` and its
+  `StorageAccess::commit_tx` — send CommitTx to ALL shards regardless of
+  individual failures (every shard must still resolve its tx), return the
+  first error. Same for `Database::commit_tx` (database.rs).
+- `main.rs` CommitTx handler: `Err` → `ErrorMsg`; `active_tx = None` either
+  way (a conflicted tx is already aborted server-side).
+- graft-client needs NO change: `commit_tx()` already maps an ERROR response
+  to `Err(io::Error)`.
+- `Shard.tx_mgr` field → `pub(crate)` so event_loop.rs tests can inject write
+  sets the same way shard.rs's own tests already do (there is still no real
+  record_write path until Milestone 2).
+
+- [x] shard.rs: `commit_current_tx()` returns Result; StorageAccess impl maps;
+      `tx_mgr` pub(crate); update doc comment (result IS surfaced now)
+- [x] executor.rs: trait signature + `ExecutionError::CommitFailed` + execute()
+      propagation; new unit test (mock storage with failing commit_tx)
+- [x] event_loop.rs: CommitTx arm → `Response::CommitResult`; new test that a
+      conflict injected via `shard.tx_mgr.record_write()` comes back as
+      `CommitResult(Err(_))` through the coordinator SPSC path
+- [x] cluster.rs: Response variant; `commit_explicit_tx()`/`commit_tx()` collect
+      per-shard results; existing tests get `.unwrap()`
+- [x] database.rs: `commit_tx()` collects per-shard results
+- [x] main.rs: CommitTx handler branches Ok/Err; wire_protocol.rs test-harness
+      call site updated
+- [x] benches (persistence.rs, query.rs): `shard.commit_tx()` now Result —
+      `.unwrap()`
+- [x] shard.rs: strengthen the 2 existing finding-#9 regression tests to also
+      assert tx1's commit returns Ok and tx2's returns Err(WriteConflict)
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+      `cargo fmt --check`
+
+### Milestone 1 — result (done)
+
+308 tests passing (306 baseline + 2 new: executor.rs
+`commit_failure_surfaces_as_execution_error`, event_loop.rs
+`event_loop_commit_tx_reports_write_conflict`), `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+
+Implemented exactly per the design block above; no deviations. Notes for the
+next coder:
+- `Shard.tx_mgr` is now `pub(crate)` (with a doc comment saying why) so
+  same-crate tests can inject write sets until Milestone 2 makes real ones.
+- Existing tests calling `shard.commit_current_tx()` / `shard.commit_tx()` /
+  `cluster.commit_explicit_tx()` got `.unwrap()` — Result is `#[must_use]`,
+  so any new call site must handle it (clippy gate enforces this).
+- `QueryResult` (graft-query executor.rs) gained `#[derive(Debug)]` — needed
+  by a test's `unwrap_err()`; harmless public addition.
+- On the auto-commit path a commit failure surfaces as
+  `ExecutionError::CommitFailed` → cluster::query's `Result<_, String>` →
+  wire ERROR ("commit failed: transaction conflict: ..."). On the explicit
+  path, server sends ERROR for COMMIT_TX and clears its per-connection
+  `active_tx` either way (the tx is already resolved shard-side).
+- graft-client needed no change (`commit_tx()` already maps ERROR → `Err`);
+  graft-cli needed no change (it only sends Query messages, and
+  `execute_query` already prints server errors).
+- The cross-shard partial-commit gap on `Err` is documented in
+  `commit_explicit_tx()`'s doc comment and deferred to Milestone 4 (flagged,
+  needs scope confirmation).
+
+## Milestone 2 — Record write sets in Shard mutation paths (root cause: `record_write()` never called, so `tx.write_set` is always empty)
+
+- All real record writes funnel through exactly three helpers
+  (`write_node_record`, `write_edge_record`, `write_prop_record`), which all
+  call `log_page_write(page_id, slot, data, page_type)` — wire
+  `tx_mgr.record_write()` there (one choke point). `log_label_write` does NOT
+  go through `log_page_write` and must NOT record (label dictionary writes use
+  a synthetic `(0,0)` key and get_or_insert is idempotent — recording would
+  make every label creation conflict with every other).
+- KEY-SPACE BUG TO AVOID: node/edge/prop files have independent page-id
+  spaces (separate `alloc_*_slot` counters), so a raw `(page_id, slot)`
+  conflict key would false-conflict node page N with edge page N. The
+  conflict key must include a record-space discriminant. Preferred: change
+  `TransactionManager`'s write-set key to `(u8 /*page_type*/, PageId, u16)`
+  (honest tuple; graft-txn's API is crate-internal). Alternative (bit-encode
+  page_type into PageId's upper bits) rejected as less readable.
+- `record_write` no-ops when `current_tx` isn't active (e.g. legacy tx-0
+  paths) — already safe.
+- Verify recovery/`apply_wal_record` paths don't route through
+  `log_page_write` (they use `write_record_to_pool_inline`) so replica apply
+  and WAL replay never record write sets.
+- Tests at shard level now use REAL mutations (no more direct
+  `tx_mgr.record_write` injection): two interleaved txs (via
+  `begin_tx_with_id`/`set_active_tx`) doing `set_node_property` on the same
+  node+key → second committer gets Err; disjoint writes (different nodes,
+  and node-page-N vs edge-page-N) → both commit Ok (key-space regression).
+- After this milestone conflicts are real at the Shard level, but still NOT
+  triggerable through the cluster/wire (see Milestone 3's root cause).
+
+- [x] graft-txn transaction.rs: write-set key `(PageId, u16)` →
+      `(u8 /*page_type*/, PageId, u16)`; `record_write()` gains `page_type`
+      param; `committed_writes` + `commit()` loop + doc comments updated;
+      4 existing tests updated to new signature; new unit test: same
+      (page,slot) under different page_type does NOT conflict
+- [x] shard.rs: `log_page_write()` calls
+      `self.tx_mgr.record_write(self.current_tx, page_type, page_id, slot)`
+      (top of fn, before WAL append); `log_label_write` deliberately NOT
+      recording (comment says why); `tx_mgr` field doc comment updated
+- [x] Verified (by reading, not assuming): WAL replay pass 2 uses free fn
+      `write_record_to_pool`, replica apply uses `write_record_to_pool_inline`
+      — neither routes through `log_page_write`, so no write-set recording
+      on replay/apply
+- [x] shard.rs: convert the 2 finding-#9 tests from `tx_mgr.record_write`
+      injection to REAL mutations (committed setup tx creates node+property;
+      txs 2/3 both `set_node_property` same key); fix stale comment block
+- [x] event_loop.rs: `event_loop_commit_tx_reports_write_conflict` updated to
+      new record_write signature (kept as injection — it tests the
+      CommitResult response plumbing, not the recording; comment updated)
+- [x] shard.rs new tests: (a) two interleaved txs set same node property →
+      second committer Err(WriteConflict); (b) disjoint property writes →
+      both commit Ok; (c) node-page-N vs edge-page-N no false conflict
+      (delete_node(n1) in tx1 vs create_edge(n2→n3) in tx2 — both hit
+      (page 0, slot 0) in their own namespaces); (d) two txs create_edge from
+      the same source node → head-pointer update conflicts, second loses
+- [x] `cargo test --workspace` (308 baseline + new), `cargo clippy --workspace
+      --all-targets -- -D warnings`, `cargo fmt --check`
+
+### Milestone 2 — result (done)
+
+313 tests passing (308 baseline + 5 new: graft-txn
+`no_conflict_same_page_slot_different_page_type`, shard.rs
+`real_mutation_write_conflict_second_committer_loses`,
+`real_mutation_disjoint_writes_both_commit`,
+`node_and_edge_page_namespaces_do_not_false_conflict`,
+`concurrent_edges_from_same_source_conflict_on_head_pointer`),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo fmt --check` clean.
+
+Implemented exactly per the design block above; no deviations. Notes for the
+next coder:
+- Conflict key is `(u8 page_type, PageId, u16 slot)` end to end:
+  `Transaction.write_set`, `TransactionManager.committed_writes`, and
+  `record_write()`'s signature all changed together. `page_type` values are
+  `graft_storage::PageType as u8` (Node=1, Edge=2, PropertyOverflow=3).
+- The single recording site is the top of `Shard::log_page_write()` — every
+  real record mutation (`write_node_record`/`write_edge_record`/
+  `write_prop_record`) funnels through it. No borrow-order issue: the call
+  happens before the WAL RefCell borrow is taken.
+- `log_label_write` deliberately does NOT record (doc comment on it explains:
+  synthetic (0,0) key + idempotent `get_or_insert` would false-conflict every
+  concurrent label creation).
+- Recovery (open pass 2) and replica apply verified by reading: they use the
+  free fn `write_record_to_pool` / `Self::write_record_to_pool_inline`
+  respectively — neither goes near `log_page_write`, so replay never records
+  write sets. `record_write` also no-ops for the legacy tx-0 paths
+  (`delete_node`'s del_tx=1 fallback, direct mutations outside a tx) because
+  tx 0 is never in the active map.
+- The 2 finding-#9 replication tests now provoke the conflict through real
+  mutations (committed setup tx 1 creates node+property; concurrent txs 2/3
+  both `set_node_property` the same key). The CommitBuffer-leak test's batch
+  assertion now deserializes the shipped batch (`WalBatchMsg.records` is raw
+  WAL bytes) and asserts no record of the losing tx ships.
+- event_loop.rs's conflict test still injects via `tx_mgr.record_write`
+  (updated to the 4-arg signature) — intentional: it tests the CommitResult
+  response plumbing in isolation; real-mutation recording is covered by
+  shard.rs's own tests. `Shard.tx_mgr` stays `pub(crate)` for exactly this
+  kind of test (doc comment updated).
+- Adjacent gap observed (pre-existing, NOT touched, may deserve a future
+  task): property records are overwritten IN PLACE and carry no
+  tx_min/tx_max, so an aborted tx's property bytes physically remain (the
+  loser's value can be read back after its abort). Conflict detection now
+  correctly reports the loser as failed, but property writes are not
+  MVCC-versioned like node/edge records. Same class of pre-existing gap as
+  index non-MVCC-awareness; out of this task's scope.
+- Conflicts are now real at the Shard level, but still NOT triggerable
+  through the cluster/wire — `ShardCluster`'s single global tx context
+  serializes all transactions (Milestone 3's root cause, unchanged).
+
+## Milestone 3 — Concurrent explicit transactions at the cluster (root cause: coordinator assumes one global tx context)
+
+Discovered during task recon, required by the task's "conflict detection can
+actually trigger" goal: `ShardCluster` serializes ALL transactions through one
+`in_explicit_tx`/`current_tx` pair —
+- a second concurrent `BEGIN` hits `assert!(!self.in_explicit_tx)` and panics
+  the coordinator thread (poisoning the server's `Arc<Mutex<ShardCluster>>`,
+  killing every connection);
+- an auto-commit query arriving while another connection's explicit tx is
+  open silently JOINS that tx (`begin_tx()` returns `current_tx` when
+  `in_explicit_tx`), so its writes are attributed to (and can be rolled back
+  with) a stranger's transaction;
+- consequence: no two transactions are ever concurrently active, so a
+  write-write conflict can never occur through the server today.
+
+Design sketch (details for the implementing coder to finalize):
+- `commit_explicit_tx(tx_id)` / `abort_explicit_tx(tx_id)` /
+  `query_in_tx(tx_id, gql)` take the tx explicitly; server passes its
+  per-connection `active_tx` (state it already tracks).
+- `begin_explicit_tx()` drops the assert; shards' TransactionManager already
+  supports N concurrently-active txs (`active: HashMap`), and the event loop
+  already restores context via `SetActiveTx` — the coordinator API is the
+  only blocker.
+- Auto-commit queries always allocate their own tx (never join): the whole
+  begin→execute→commit runs under one coordinator mutex hold, so a transient
+  per-call tx context replaces the persistent global one.
+- Server orphan-abort on disconnect passes the connection's tx_id.
+- End-to-end regression tests over the wire protocol: (a) two connections
+  BEGIN concurrently without panic; (b) conflicting SETs → loser's COMMIT
+  returns ERROR, winner's value persists; (c) auto-commit query during
+  another connection's explicit tx does not join it (its write commits
+  independently and survives the other tx's ROLLBACK).
+
+Implementation notes (finalized at implementation time):
+- `current_tx`/`in_explicit_tx` stay as fields but become TRANSIENT per-call
+  execution context for the executor's StorageAccess callbacks: `query_in_tx`
+  sets them just before `executor::execute()` and clears them right after
+  (both paths), so the existing begin/commit/abort no-op plumbing is reused
+  unchanged. Between public calls both are always 0/false (`execute()` always
+  ends in `commit_tx` or `abort_tx`, which reset `current_tx` on the
+  auto-commit path).
+- Conflict wire test must order writes so the WINNER writes last: property
+  records are overwritten in place with no MVCC versioning (pre-existing gap,
+  see M2 result), so the loser's physical bytes would otherwise be what a
+  later read returns even though its commit correctly errored.
+
+- [x] cluster.rs: `begin_explicit_tx()` drops the assert + persistent state;
+      `commit_explicit_tx(tx_id)`, `abort_explicit_tx(tx_id)`,
+      `query_in_tx(tx_id, gql)` take the tx explicitly; struct field doc
+      comments updated to transient-context semantics
+- [x] cluster.rs tests: update 7 existing call sites to new signatures; new
+      tests: (a) two interleaved explicit txs, conflicting SETs → second
+      committer Err + winner-writes-last value persists; (b) disjoint
+      explicit txs both commit Ok; (c) auto-commit during an open explicit
+      tx commits independently and survives that tx's abort
+- [x] main.rs: CommitTx/RollbackTx/Query/orphan-abort handlers pass the
+      connection's `active_tx` tx_id
+- [x] wire_protocol.rs: test harness mirrors main.rs; new end-to-end tests
+      (a)/(b)/(c) from the design sketch over two real client connections
+- [x] replication.rs test: `abort_explicit_tx(tx_id)` call site updated
+- [x] `cargo test --workspace` (313 baseline + new), `cargo clippy --workspace
+      --all-targets -- -D warnings`, `cargo fmt --check`
+- [x] CLAUDE.md Transaction Model bullet updated; todo.md M3 result written
+
+### Milestone 3 — result (done)
+
+319 tests passing (313 baseline + 6 new: cluster.rs
+`concurrent_explicit_txs_conflicting_writes_second_committer_loses`,
+`concurrent_explicit_txs_disjoint_writes_both_commit`,
+`auto_commit_query_does_not_join_open_explicit_tx`; wire_protocol.rs
+`two_connections_begin_concurrently_without_panic`,
+`conflicting_commits_loser_gets_error_winner_persists`,
+`auto_commit_on_other_connection_does_not_join_explicit_tx`),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo fmt --check` clean. wire_protocol tests re-run 3x — stable.
+
+Implemented per the design sketch + implementation notes above; no
+deviations. Notes for the next coder:
+- `ShardCluster`'s `current_tx`/`in_explicit_tx` fields were NOT removed:
+  they became transient per-call execution context for the executor's
+  `StorageAccess` callbacks (`query_in_tx` sets them immediately before
+  `executor::execute()` and clears them right after, on both Ok and Err
+  paths). Between public calls both are always 0/false — the auto-commit
+  path's `commit_tx`/`abort_tx` reset `current_tx`, and `execute()` always
+  ends in exactly one of them. This reuses the existing begin/commit/abort
+  no-op plumbing unchanged rather than threading a tx parameter through
+  graft-query's `StorageAccess` trait.
+- `begin_explicit_tx()` still fans `BeginTx` out to ALL shards (every
+  shard's TransactionManager needs the tx in its active map with a
+  snapshot); `query_in_tx` still fans `SetActiveTx` out before parsing.
+  Shard-side nothing changed — event_loop.rs's CommitTx/AbortTx arms were
+  already tx_id-parameterized (they call `set_active_tx(tx_id)` first).
+- Server (main.rs): CommitTx/RollbackTx handlers use
+  `let Some(tx_id) = active_tx.take() else { ... }` — state cleared up
+  front since the tx is over either way; Query passes `active_tx`'s tx_id;
+  orphan-abort on disconnect passes the connection's tx_id. The
+  "transaction already active" guard on BEGIN is per-connection wire
+  protocol policy and stays.
+- The conflict tests order writes so the WINNER writes last: property
+  records are overwritten in place with no MVCC versioning (pre-existing
+  gap, see M2 result), so with the loser writing last a read-back would
+  return the loser's bytes even though its commit correctly errored. The
+  commit Ok/Err assertions are ordering-independent; only the final-value
+  assertion needs this.
+- The M4 gap is unchanged and documented in `commit_explicit_tx`'s doc
+  comment: no cross-shard prepare phase, so a multi-shard conflicting tx
+  commits on non-conflicting shards while the client gets an error.
+  M4 remains FLAGGED — needs orchestrator/human scope confirmation.
+
+## Milestone 4 — Cross-shard commit atomicity (root cause: fan-out commit has no prepare phase) — FLAGGED, confirm scope before building
+
+Once Milestone 3 makes conflicts triggerable, a multi-shard tx that conflicts
+on one shard aborts there but commits on the others — the client gets an
+error while half its writes are visible. Fix: two-phase commit under the
+coordinator mutex (which serializes all commits, making this sound):
+`TransactionManager::validate(tx_id)` (extract the conflict-check loop),
+`Request::PrepareCommit` fan-out first, then CommitTx-all or AbortTx-all.
+This is adjacent scope beyond the literal task ask — get orchestrator/human
+confirmation before implementing. Until then the partial-commit anomaly is a
+documented, pre-announced gap (strictly better than today's silent lost
+updates).
+
+## Verification (every milestone)
+
+- `cargo test --workspace` green (306 at baseline)
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo fmt --check` clean
+
+---
+
+# Phase 8f Replication — Code Review Fix Plan (PREVIOUS TASK — COMPLETE)
 
 Source: `tasks/code-review-findings.md` (15 confirmed findings, ranked by severity).
 Baseline: 278 tests passing on main.
