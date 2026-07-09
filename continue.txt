@@ -14,8 +14,12 @@ sections.
 **Milestones 1, 2 AND 3 are DONE and verified** (319 tests passing = 313
 after M2 + 6 from M3; `cargo clippy --workspace --all-targets -- -D warnings`
 clean; `cargo fmt --check` clean; wire_protocol tests re-run 3x stable).
-NOT committed to git — all changes are working-tree only (the user hasn't
-asked for a commit). Baseline main is at c1b91ee.
+**Committed and pushed**: all M1+M2+M3 changes were committed to `main` as
+`bc99b39` ("Wire up write-conflict detection end-to-end") on 2026-07-09 at
+the user's explicit request and pushed to origin (DendroLabs/graft-db).
+The user also decided to STOP at the delivered scope: Milestone 4
+(cross-shard commit atomicity) was explicitly declined for now — it stays
+documented below and in tasks/todo.md as known future work.
 
 **The literal task ask is now fully delivered end-to-end**: write sets are
 recorded through real mutation paths (M2), commit results surface to wire
@@ -133,10 +137,6 @@ cargo clippy --workspace --all-targets -- -D warnings   # expect clean
 cargo fmt --check               # expect clean
 ```
 
-`git status --short` shows exactly these uncommitted modifications (expected
-— M1+M2+M3 are not committed; user hasn't asked): CLAUDE.md, continue.txt,
-crates/graft-query/src/executor.rs, crates/graft-runtime/benches/
-{persistence,query}.rs, crates/graft-runtime/src/{cluster,database,
-event_loop,shard}.rs, crates/graft-server/src/main.rs,
-crates/graft-server/tests/{replication,wire_protocol}.rs,
-crates/graft-txn/src/transaction.rs, tasks/{lessons,todo}.md.
+`git status --short` should be clean (aside from this file's own follow-up
+edit if not yet committed) — M1+M2+M3 were committed as `bc99b39` and pushed
+to origin/main on 2026-07-09.
