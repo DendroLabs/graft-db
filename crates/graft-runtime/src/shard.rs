@@ -29,6 +29,27 @@ const DEFAULT_POOL_CAPACITY: usize = 1024;
 const GROUP_COMMIT_INTERVAL_MS: u64 = 2;
 const GROUP_COMMIT_MAX_PENDING: u32 = 64;
 
+/// Replication LSN durability: `repl_next_lsn` must survive a primary
+/// restart and must never reissue a value that could already have been
+/// shipped to a replica (a reissued LSN <= a replica's last-applied LSN
+/// gets silently deduped forever — see `ReplicationReceiver::on_batch`).
+///
+/// WAL records are shipped to replicas as soon as a transaction commits,
+/// independent of the WAL's own group-commit fsync schedule (replication
+/// shipping is not gated on local WAL durability) — so persisting the LSN
+/// counter's *current* value on the WAL's fsync cadence would not actually
+/// bound "already shipped": a batch can reach a replica well before the
+/// corresponding fsync happens. Instead, reserve a ceiling ahead of time:
+/// before handing out any LSN beyond the last persisted ceiling, persist a
+/// new ceiling `REPL_LSN_RESERVE_BATCH` ahead and fsync it, then hand out
+/// LSNs from the reserved range without further syncing. On restart, resume
+/// from `ceiling + 1` — strictly above anything that could have been
+/// issued (and possibly shipped) in the prior run. This bounds the extra
+/// fsync to once per 10,000 LSNs (negligible) and only ever "wastes" a
+/// bounded, harmless gap of unused LSN values on crash — u64 LSN space
+/// makes that irrelevant even at 1B+ record scale.
+const REPL_LSN_RESERVE_BATCH: u64 = 10_000;
+
 // ---------------------------------------------------------------------------
 // ShardConfig
 // ---------------------------------------------------------------------------
@@ -131,6 +152,10 @@ pub struct Shard {
     repl_enabled: bool,
     repl_log: Vec<graft_txn::wal::WalRecord>,
     repl_next_lsn: u64,
+    // Highest LSN ceiling durably reserved so far (see
+    // REPL_LSN_RESERVE_BATCH doc comment). `repl_next_lsn` may be handed
+    // out up to and including this value without persisting again.
+    repl_lsn_ceiling: u64,
 
     // I/O + WAL — None for ephemeral shards
     io: Option<RefCell<Box<dyn IoBackend + Send>>>,
@@ -139,6 +164,7 @@ pub struct Shard {
     edge_file: Option<FileHandle>,
     prop_file: Option<FileHandle>,
     label_file: Option<FileHandle>,
+    repl_lsn_file: Option<FileHandle>,
     _wal_file: Option<FileHandle>,
 }
 
@@ -171,12 +197,14 @@ impl Shard {
             repl_enabled: false,
             repl_log: Vec::new(),
             repl_next_lsn: 1,
+            repl_lsn_ceiling: 0,
             io: None,
             wal: None,
             node_file: None,
             edge_file: None,
             prop_file: None,
             label_file: None,
+            repl_lsn_file: None,
             _wal_file: None,
         }
     }
@@ -204,6 +232,24 @@ impl Shard {
         let prop_fh = io.open(&shard_dir.join("props.dat"), &opts)?;
         let label_fh = io.open(&shard_dir.join("labels.dat"), &opts)?;
         let wal_fh = io.open(&shard_dir.join("shard.wal"), &opts)?;
+        // `.meta` (not `.dat`) so IoUringBackend doesn't open it O_DIRECT —
+        // it's read/written as a single unaligned 8-byte counter.
+        let repl_lsn_fh = io.open(&shard_dir.join("repl_lsn.meta"), &opts)?;
+
+        // Read the persisted replication LSN reservation ceiling (0 if this
+        // shard has never been a replication primary before). See
+        // REPL_LSN_RESERVE_BATCH doc comment for why this must be a
+        // reserved ceiling rather than the last-issued value.
+        let repl_lsn_ceiling: u64 = {
+            let mut buf = [0u8; 8];
+            if io.file_size(repl_lsn_fh)? >= 8
+                && io.read_at(repl_lsn_fh, 0, &mut buf).unwrap_or(0) == 8
+            {
+                u64::from_le_bytes(buf)
+            } else {
+                0
+            }
+        };
 
         let cap = config.pool_capacity;
         let mut node_pool = BufferPool::new(cap);
@@ -534,13 +580,18 @@ impl Shard {
             last_applied_lsn: 0,
             repl_enabled: false,
             repl_log: Vec::new(),
-            repl_next_lsn: 1,
+            // Resume strictly above the persisted reservation ceiling, not
+            // from 1 — otherwise a primary restart would reissue LSNs a
+            // replica may already have applied (finding #2).
+            repl_next_lsn: repl_lsn_ceiling + 1,
+            repl_lsn_ceiling,
             io: Some(RefCell::new(io)),
             wal: Some(RefCell::new(wal)),
             node_file: Some(node_fh),
             edge_file: Some(edge_fh),
             prop_file: Some(prop_fh),
             label_file: Some(label_fh),
+            repl_lsn_file: Some(repl_lsn_fh),
             _wal_file: Some(wal_fh),
         })
     }
@@ -989,6 +1040,33 @@ impl Shard {
     }
 
     /// Log a page write to the WAL (and replication log if enabled).
+    /// Allocate the next replication LSN. Persists a reservation ceiling
+    /// ahead of time (see `REPL_LSN_RESERVE_BATCH`) the first time
+    /// `repl_next_lsn` would exceed the last persisted ceiling, so a crash
+    /// immediately after handing out this LSN can never cause a future
+    /// restart to reissue it or any earlier value.
+    fn next_repl_lsn(&mut self) -> u64 {
+        if self.repl_next_lsn > self.repl_lsn_ceiling {
+            let new_ceiling = self.repl_next_lsn + REPL_LSN_RESERVE_BATCH - 1;
+            if let (Some(ref io_cell), Some(fh)) = (&self.io, self.repl_lsn_file) {
+                let mut io = io_cell.borrow_mut();
+                if io.write_at(fh, 0, &new_ceiling.to_le_bytes()).is_ok() {
+                    let _ = io.sync(fh);
+                } else {
+                    tracing::warn!(
+                        "failed to persist replication LSN ceiling for shard {}; \
+                         a crash before the next successful persist could reuse LSNs",
+                        self.shard_id
+                    );
+                }
+            }
+            self.repl_lsn_ceiling = new_ceiling;
+        }
+        let lsn = self.repl_next_lsn;
+        self.repl_next_lsn += 1;
+        lsn
+    }
+
     fn log_page_write(
         &mut self,
         page_id: PageId,
@@ -1012,8 +1090,7 @@ impl Shard {
             }
         }
         if self.repl_enabled {
-            let lsn = self.repl_next_lsn;
-            self.repl_next_lsn += 1;
+            let lsn = self.next_repl_lsn();
             self.repl_log.push(graft_txn::wal::WalRecord {
                 lsn,
                 tx_id: self.current_tx,
@@ -1043,8 +1120,7 @@ impl Shard {
             }
         }
         if self.repl_enabled {
-            let lsn = self.repl_next_lsn;
-            self.repl_next_lsn += 1;
+            let lsn = self.next_repl_lsn();
             self.repl_log.push(graft_txn::wal::WalRecord {
                 lsn,
                 tx_id: self.current_tx,
@@ -1064,9 +1140,11 @@ impl Shard {
         self.tx_mgr.begin_with_id(tx_id, wal_opt);
         self.current_tx = tx_id;
         self.current_snapshot = self.tx_mgr.snapshot(tx_id).cloned();
+        // Drop the WAL RefCell borrow before next_repl_lsn() needs &mut self
+        // (it may need to borrow self.io to persist a reservation ceiling).
+        drop(wal_ref);
         if self.repl_enabled {
-            let lsn = self.repl_next_lsn;
-            self.repl_next_lsn += 1;
+            let lsn = self.next_repl_lsn();
             self.repl_log.push(graft_txn::wal::WalRecord {
                 lsn,
                 tx_id,
@@ -1082,6 +1160,16 @@ impl Shard {
     /// cache immediately (safe against process crashes) but fsync is deferred
     /// until the group commit interval (2ms) has elapsed. This bounds the
     /// worst-case data loss on power failure to ~2ms of committed transactions.
+    ///
+    /// `tx_mgr.commit()` can fail with `WriteConflict` (first-committer-wins);
+    /// on failure the transaction was already internally aborted (its Abort
+    /// record is in the *local* WAL). The `Result` is intentionally not
+    /// surfaced to the caller here — event_loop.rs's `Request::CommitTx`
+    /// handler and the auto-commit/explicit-tx callers in cluster.rs all
+    /// treat every commit as unconditionally successful today. That's a
+    /// separate, pre-existing gap (a client is never told its commit lost a
+    /// conflict) outside this fix's scope; what this function *does* handle
+    /// correctly is not shipping a false `Commit` to replicas (see below).
     pub fn commit_current_tx(&mut self) {
         if self.current_tx == 0 {
             return;
@@ -1089,7 +1177,7 @@ impl Shard {
         let tx_id = self.current_tx;
 
         // Scope the RefCell borrows so they're dropped before the group commit sync.
-        {
+        let commit_result = {
             let mut wal_ref = self.wal.as_ref().map(|w| w.borrow_mut());
             let wal_opt = wal_ref.as_deref_mut();
             let mut io_ref = self.io.as_ref().map(|i| i.borrow_mut());
@@ -1097,16 +1185,26 @@ impl Shard {
                 Some(r) => Some(&mut ***r),
                 None => None,
             };
-            let _ = self.tx_mgr.commit(tx_id, wal_opt, io_opt);
-        }
+            self.tx_mgr.commit(tx_id, wal_opt, io_opt)
+        };
 
+        // Only ship a replication Commit on an actual commit. On a
+        // WriteConflict, tx_mgr.commit() already aborted the tx internally
+        // (local WAL got an Abort record) -- ship an Abort here too, not
+        // nothing: CommitBuffer::append only ever resolves a buffered tx_id
+        // on seeing an explicit terminal Commit or Abort record, so omitting
+        // both would leak this tx_id in CommitBuffer.pending forever.
         if self.repl_enabled {
-            let lsn = self.repl_next_lsn;
-            self.repl_next_lsn += 1;
+            let record_type = if commit_result.is_ok() {
+                WalRecordType::Commit
+            } else {
+                WalRecordType::Abort
+            };
+            let lsn = self.next_repl_lsn();
             self.repl_log.push(graft_txn::wal::WalRecord {
                 lsn,
                 tx_id,
-                record_type: WalRecordType::Commit,
+                record_type,
                 body: WalBody::Empty,
             });
         }
@@ -1153,9 +1251,11 @@ impl Shard {
         let mut wal_ref = self.wal.as_ref().map(|w| w.borrow_mut());
         let wal_opt = wal_ref.as_deref_mut();
         self.tx_mgr.abort(tx_id, wal_opt);
+        // Drop the WAL RefCell borrow before next_repl_lsn() needs &mut self
+        // (it may need to borrow self.io to persist a reservation ceiling).
+        drop(wal_ref);
         if self.repl_enabled {
-            let lsn = self.repl_next_lsn;
-            self.repl_next_lsn += 1;
+            let lsn = self.next_repl_lsn();
             self.repl_log.push(graft_txn::wal::WalRecord {
                 lsn,
                 tx_id,
@@ -2301,5 +2401,198 @@ mod tests {
 
         let log2 = shard.drain_repl_log();
         assert!(log2.is_empty());
+    }
+
+    // -- Regression tests for finding #2: replication LSN must survive a
+    // primary restart and must never reissue an LSN that could already
+    // have been shipped to a replica. --------------------------------------
+
+    #[test]
+    fn repl_lsn_starts_at_one_for_a_never_replicated_durable_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shard = Shard::open(
+            0,
+            &ShardConfig {
+                data_dir: dir.path().to_owned(),
+                pool_capacity: 64,
+            },
+        )
+        .unwrap();
+        shard.enable_replication();
+        shard.begin_tx_with_id(1);
+        shard.commit_current_tx();
+        let log = shard.drain_repl_log();
+        assert_eq!(log[0].lsn, 1, "first-ever LSN on a fresh shard is 1");
+    }
+
+    #[test]
+    fn repl_lsn_survives_reopen_and_never_goes_backward_or_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ShardConfig {
+            data_dir: dir.path().to_owned(),
+            pool_capacity: 64,
+        };
+
+        let last_lsn_before_restart;
+        {
+            let mut shard = Shard::open(0, &config).unwrap();
+            shard.enable_replication();
+            shard.begin_tx_with_id(1);
+            shard.create_node(Some("N"), &[]);
+            shard.commit_current_tx();
+            let log = shard.drain_repl_log();
+            last_lsn_before_restart = log.last().unwrap().lsn;
+            // Dropped here — simulates the primary process exiting. No
+            // explicit flush() call: next_repl_lsn() persists+fsyncs the
+            // reservation ceiling synchronously as soon as it's crossed,
+            // independent of the WAL's own group-commit schedule.
+        }
+
+        // Re-open at the same directory — simulates the primary restarting.
+        let mut shard = Shard::open(0, &config).unwrap();
+        shard.enable_replication();
+        shard.begin_tx_with_id(2);
+        shard.commit_current_tx();
+        let log = shard.drain_repl_log();
+        let first_lsn_after_restart = log[0].lsn;
+
+        assert!(
+            first_lsn_after_restart > last_lsn_before_restart,
+            "restart must never reissue or go below a previously-issued LSN: \
+             before={last_lsn_before_restart}, after={first_lsn_after_restart}"
+        );
+        // The reservation ceiling was crossed by the very first LSN issued
+        // before the restart (1 > initial ceiling of 0), so the persisted
+        // ceiling jumped straight to REPL_LSN_RESERVE_BATCH — proving the
+        // restart resumed from the *reserved* ceiling, not the last-issued
+        // value (which would have only been a gap of a handful of LSNs).
+        assert_eq!(first_lsn_after_restart, REPL_LSN_RESERVE_BATCH + 1);
+    }
+
+    #[test]
+    fn repl_lsn_reservation_bounds_extra_fsyncs_across_many_records() {
+        // Issuing far fewer than REPL_LSN_RESERVE_BATCH records in a single
+        // run must only cross the reservation boundary once (checked
+        // indirectly: the persisted ceiling after a reopen is still exactly
+        // one batch, not one-per-record).
+        let dir = tempfile::tempdir().unwrap();
+        let config = ShardConfig {
+            data_dir: dir.path().to_owned(),
+            pool_capacity: 64,
+        };
+        {
+            let mut shard = Shard::open(0, &config).unwrap();
+            shard.enable_replication();
+            for i in 0..50u64 {
+                shard.begin_tx_with_id(i + 1);
+                shard.create_node(Some("N"), &[]);
+                shard.commit_current_tx();
+            }
+            shard.drain_repl_log();
+        }
+        let mut shard = Shard::open(0, &config).unwrap();
+        shard.enable_replication();
+        shard.begin_tx_with_id(1000);
+        shard.commit_current_tx();
+        let log = shard.drain_repl_log();
+        // Still resumes from the first reserved batch's ceiling, not from
+        // ~150 (50 txs * ~3 records each) — confirming one reservation
+        // covered the whole run instead of persisting on every LSN.
+        assert_eq!(log[0].lsn, REPL_LSN_RESERVE_BATCH + 1);
+    }
+
+    // -- Regression tests for finding #9: a transaction the primary
+    // internally aborted (WriteConflict, first-committer-wins) must never
+    // be shipped to replicas as a Commit. -----------------------------------
+    //
+    // Shard doesn't currently call TransactionManager::record_write() from
+    // any of its mutation methods, so a real WriteConflict can't yet occur
+    // through Shard's own public API — these tests provoke one by calling
+    // tx_mgr.record_write() directly (legal: same-module private field
+    // access), simulating what real write-conflict-tracking wiring would
+    // eventually produce.
+
+    #[test]
+    fn commit_write_conflict_ships_abort_not_commit() {
+        let mut shard = Shard::new(0);
+        shard.enable_replication();
+
+        // tx1 and tx2 both begin while the other is still active, so each
+        // one's snapshot treats the other as concurrent (required for
+        // first-committer-wins to actually flag a conflict — see
+        // graft-txn's `first_committer_wins` test for the same pattern).
+        shard.begin_tx_with_id(1);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(2);
+
+        // Both write to the same (page_id, slot).
+        shard.tx_mgr.record_write(1, 1, 0);
+        shard.tx_mgr.record_write(2, 1, 0);
+
+        // tx1 commits first — succeeds, ships a real Commit.
+        shard.set_active_tx(1);
+        shard.commit_current_tx();
+
+        // tx2 commits second — first-committer-wins conflict, internally
+        // aborted by tx_mgr.commit(). Must ship an Abort, not a Commit.
+        shard.set_active_tx(2);
+        shard.commit_current_tx();
+
+        let log = shard.drain_repl_log();
+        let tx1_records: Vec<_> = log.iter().filter(|r| r.tx_id == 1).collect();
+        let tx2_records: Vec<_> = log.iter().filter(|r| r.tx_id == 2).collect();
+
+        assert_eq!(
+            tx1_records.last().unwrap().record_type,
+            WalRecordType::Commit
+        );
+        assert_eq!(
+            tx2_records.last().unwrap().record_type,
+            WalRecordType::Abort,
+            "a WriteConflict-aborted transaction must ship Abort, not Commit"
+        );
+        assert!(
+            tx2_records
+                .iter()
+                .all(|r| r.record_type != WalRecordType::Commit),
+            "no record for the conflicting tx may claim Commit"
+        );
+    }
+
+    #[test]
+    fn commit_write_conflict_does_not_leak_commit_buffer_pending_entry() {
+        // Reproduces the leak that shipping *nothing* (instead of an
+        // explicit Abort) would cause: CommitBuffer only ever resolves a
+        // buffered tx_id on seeing an explicit terminal Commit or Abort
+        // record for it.
+        let mut shard = Shard::new(0);
+        shard.enable_replication();
+
+        shard.begin_tx_with_id(1);
+        shard.set_active_tx(0);
+        shard.begin_tx_with_id(2);
+        shard.tx_mgr.record_write(1, 1, 0);
+        shard.tx_mgr.record_write(2, 1, 0);
+        shard.set_active_tx(1);
+        shard.commit_current_tx();
+        shard.set_active_tx(2);
+        shard.commit_current_tx();
+
+        let log = shard.drain_repl_log();
+
+        let mut sender = graft_repl::ReplicationSender::new(0);
+        for record in log {
+            sender.on_wal_record(record);
+        }
+        sender.poll();
+
+        assert_eq!(
+            sender.commit_buffer().pending_count(),
+            0,
+            "the conflicting tx's records must not be stuck in CommitBuffer.pending forever"
+        );
+
+        let batches = sender.drain_outbound();
+        assert_eq!(batches.len(), 1, "only tx1's real commit should ship");
     }
 }

@@ -132,12 +132,16 @@ impl IoUringBackend {
         x
     }
 
-    /// Determine if a path is a data file (not WAL) based on extension.
-    /// Data files use O_DIRECT; WAL files don't (small sequential writes).
+    /// Determine if a path is a data file (not WAL/metadata) based on
+    /// extension. Data files use O_DIRECT; WAL and small metadata files
+    /// don't, since O_DIRECT requires aligned offsets/lengths and these
+    /// files are read/written with small, unaligned buffers (a WAL record,
+    /// an 8-byte counter, etc.).
     fn is_data_file(path: &Path) -> bool {
         match path.extension().and_then(|e| e.to_str()) {
             Some("dat") => true,
             Some("wal") => false,
+            Some("meta") => false,
             _ => true,
         }
     }

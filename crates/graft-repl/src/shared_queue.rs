@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::protocol::WalBatchMsg;
+
 /// Thread-safe queue for passing messages between shard event loops and
 /// network I/O threads. Wraps `Arc<Mutex<VecDeque<T>>>`.
+#[derive(Debug)]
 pub struct SharedQueue<T> {
     inner: Arc<Mutex<VecDeque<T>>>,
 }
@@ -27,6 +30,38 @@ impl<T> SharedQueue<T> {
         let mut q = self.inner.lock().unwrap();
         q.drain(..).collect()
     }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clone the front item without removing it. Used by writer threads that
+    /// must not lose an item if the send fails partway — the item stays
+    /// queued until `pop_front` confirms it was actually delivered.
+    pub fn peek_front(&self) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.inner.lock().unwrap().front().cloned()
+    }
+
+    /// Remove and return the front item. Pair with `peek_front` for
+    /// send-then-confirm delivery (see above).
+    pub fn pop_front(&self) -> Option<T> {
+        self.inner.lock().unwrap().pop_front()
+    }
+
+    /// Sum of `f` applied to every queued item. Used to enforce a bounded
+    /// byte budget per queue without a separate atomic counter to keep in
+    /// sync — O(n) in queue length, which is self-limiting since callers
+    /// use this to enforce the very cap that bounds n.
+    pub fn total_bytes_by<F: Fn(&T) -> usize>(&self, f: F) -> usize {
+        self.inner.lock().unwrap().iter().map(f).sum()
+    }
 }
 
 impl<T> Clone for SharedQueue<T> {
@@ -49,7 +84,11 @@ pub enum ReplControl {
     Register {
         id: String,
         shard_id: u8,
-        last_lsn: u64,
+        /// The replica's outbound batch queue, resolved through
+        /// `ReplicaOutboxRegistry` so a reconnecting replica is handed the
+        /// exact same queue (and any backlog buffered while it was
+        /// disconnected) rather than an empty one.
+        outbox: SharedQueue<WalBatchMsg>,
     },
     Unregister {
         id: String,

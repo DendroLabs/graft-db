@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 use graft_core::{EdgeId, NodeId, ShardId, TxId};
 use graft_query::executor::{EdgeInfo, NodeInfo, StorageAccess, Value};
 use graft_query::{self, QueryResult};
-use graft_repl::{ReplControl, SharedQueue, WalAckMsg, WalBatchMsg};
+use graft_repl::{ReplControl, ReplicaOutboxRegistry, SharedQueue, WalAckMsg, WalBatchMsg};
 
 use crate::affinity;
 use crate::event_loop::ShardEventLoop;
@@ -78,7 +78,6 @@ pub(crate) enum Request {
     AbortTx {
         tx_id: TxId,
     },
-    GetNextTxId,
     Flush,
     Shutdown,
 }
@@ -91,7 +90,6 @@ pub(crate) enum Response {
     Edges(Vec<EdgeInfo>),
     NodeId(NodeId),
     EdgeId(EdgeId),
-    TxId(TxId),
     Done,
 }
 
@@ -155,8 +153,12 @@ impl Drop for ShardHandle {
 /// Per-shard replication queues, consumed by network transport threads.
 pub struct ShardReplQueues {
     pub shard_id: ShardId,
-    /// Primary: outbound WAL batches.
-    pub outbox: Option<SharedQueue<WalBatchMsg>>,
+    /// Primary: directory of per-replica outbound WAL batch queues. The
+    /// network layer resolves a connecting replica's queue through this
+    /// (creating it on first connect, reusing it on reconnect) and hands
+    /// the resulting `SharedQueue` to the shard via a `Register` control
+    /// message — see `ReplicaOutboxRegistry`.
+    pub outbox_registry: Option<ReplicaOutboxRegistry>,
     /// Primary: inbound ACKs (replica_id, acked_lsn).
     pub ack_inbox: Option<SharedQueue<(String, u64)>>,
     /// Replica: inbound WAL batches.
@@ -175,6 +177,40 @@ pub struct ReplHandles {
 // ---------------------------------------------------------------------------
 // ShardCluster — multi-threaded shard-per-core database
 // ---------------------------------------------------------------------------
+
+/// Reserved base for tx_ids assigned to read-only snapshot transactions on
+/// **replica** clusters (`new_replica`/`open_replica`).
+///
+/// Real transactions (standalone/primary, or replicated from a primary) use
+/// plain, monotonically increasing `TxId`s starting at 1, applied to a
+/// replica shard entirely independently of the replica's own query engine
+/// (via `Shard::apply_wal_record`). If a replica's own read-only queries
+/// drew tx_ids from that same low range, a query could be handed the exact
+/// tx_id a concurrently in-flight replicated primary transaction is using —
+/// `Shard::is_record_visible`'s own-write bypass (`tx_min == current_tx`)
+/// would then treat that primary transaction's partially-applied,
+/// not-yet-committed-on-the-replica writes as the query's own writes,
+/// violating snapshot isolation (finding #7).
+///
+/// Rather than bound that race (e.g. "sync to max + a large gap" — still
+/// theoretically closable by a long-lived query racing a fast-committing
+/// primary), replica clusters draw their snapshot tx_ids from a disjoint
+/// range that a primary can never reach: the top half of the u64 space (bit
+/// 63 set). A primary would need to commit over 2^63 transactions to ever
+/// collide with this range — impossible at any realistic scale, in the
+/// spirit of this project's "design for 1B+ scale" principle applied in the
+/// other direction (2^63 is billions of transactions per second for
+/// billions of years).
+///
+/// Because the two ranges never overlap, a replica's tx_id counter needs no
+/// synchronization with shard-level state at all: no periodic
+/// cross-shard round trip is required (unlike the `sync_tx_counter()`
+/// mechanism this replaced, which also cost every auto-commit query a
+/// blocking `GetNextTxId` round trip to every shard even on
+/// standalone/primary clusters that could never need it — finding #13).
+/// `begin_explicit_tx()` draws from the same counter with no special-casing,
+/// which also fixes finding #8 for free.
+const REPLICA_TX_ID_BASE: TxId = 1 << 63;
 
 /// A database that runs each shard on its own OS thread.
 ///
@@ -330,21 +366,20 @@ impl ShardCluster {
             let mut shard = Shard::new(shard_id);
             shard.enable_replication();
 
-            let outbox = SharedQueue::new();
+            let outbox_registry = ReplicaOutboxRegistry::new();
             let ack_inbox = SharedQueue::new();
             let control = SharedQueue::new();
-            let outbox_c = outbox.clone();
             let ack_inbox_c = ack_inbox.clone();
             let control_c = control.clone();
 
             let handle = Self::spawn_worker_with_setup(shard, shard_id, pin_cores, move |el| {
                 el.set_repl_sender(graft_repl::ReplicationSender::new(shard_id));
-                el.set_repl_primary_queues(outbox_c, ack_inbox_c, control_c);
+                el.set_repl_primary_queues(ack_inbox_c, control_c);
             });
             handles.push(handle);
             repl_shards.push(ShardReplQueues {
                 shard_id,
-                outbox: Some(outbox),
+                outbox_registry: Some(outbox_registry),
                 ack_inbox: Some(ack_inbox),
                 inbox: None,
                 ack_outbox: None,
@@ -390,7 +425,7 @@ impl ShardCluster {
             handles.push(handle);
             repl_shards.push(ShardReplQueues {
                 shard_id,
-                outbox: None,
+                outbox_registry: None,
                 ack_inbox: None,
                 inbox: Some(inbox),
                 ack_outbox: Some(ack_outbox),
@@ -401,7 +436,10 @@ impl ShardCluster {
         let cluster = Self {
             handles,
             next_shard: AtomicU8::new(0),
-            next_tx_id: AtomicU64::new(1),
+            // See REPLICA_TX_ID_BASE's doc comment: a disjoint range from
+            // real (primary-issued/replicated) tx_ids, so no synchronization
+            // with shard-level state is ever needed.
+            next_tx_id: AtomicU64::new(REPLICA_TX_ID_BASE),
             current_tx: 0,
             in_explicit_tx: false,
             pin_cores,
@@ -443,21 +481,20 @@ impl ShardCluster {
 
         for shard in shards {
             let shard_id = shard.shard_id();
-            let outbox = SharedQueue::new();
+            let outbox_registry = ReplicaOutboxRegistry::new();
             let ack_inbox = SharedQueue::new();
             let control = SharedQueue::new();
-            let outbox_c = outbox.clone();
             let ack_inbox_c = ack_inbox.clone();
             let control_c = control.clone();
 
             let handle = Self::spawn_worker_with_setup(shard, shard_id, pin_cores, move |el| {
                 el.set_repl_sender(graft_repl::ReplicationSender::new(shard_id));
-                el.set_repl_primary_queues(outbox_c, ack_inbox_c, control_c);
+                el.set_repl_primary_queues(ack_inbox_c, control_c);
             });
             handles.push(handle);
             repl_shards.push(ShardReplQueues {
                 shard_id,
-                outbox: Some(outbox),
+                outbox_registry: Some(outbox_registry),
                 ack_inbox: Some(ack_inbox),
                 inbox: None,
                 ack_outbox: None,
@@ -488,8 +525,12 @@ impl ShardCluster {
     ) -> std::io::Result<(Self, ReplHandles)> {
         assert!((1..=256).contains(&n), "shard count must be 1..=256");
 
+        // Unlike open()/open_primary(), no shard-level tx_id high-water mark
+        // needs to be computed here: a replica's own next_tx_id counter is
+        // seeded from the disjoint REPLICA_TX_ID_BASE range below, entirely
+        // independent of what shard-level tx_ids replicated data recovers to
+        // (see REPLICA_TX_ID_BASE's doc comment).
         let mut shards = Vec::with_capacity(n);
-        let mut max_tx: TxId = 0;
         for i in 0..n {
             let shard_id = i as ShardId;
             let config = ShardConfig {
@@ -497,9 +538,6 @@ impl ShardCluster {
                 pool_capacity: 1024,
             };
             let shard = Shard::open(shard_id, &config)?;
-            if shard.next_local_tx() > max_tx {
-                max_tx = shard.next_local_tx();
-            }
             shards.push(shard);
         }
 
@@ -520,7 +558,7 @@ impl ShardCluster {
             handles.push(handle);
             repl_shards.push(ShardReplQueues {
                 shard_id,
-                outbox: None,
+                outbox_registry: None,
                 ack_inbox: None,
                 inbox: Some(inbox),
                 ack_outbox: Some(ack_outbox),
@@ -532,7 +570,7 @@ impl ShardCluster {
             Self {
                 handles,
                 next_shard: AtomicU8::new(0),
-                next_tx_id: AtomicU64::new(max_tx),
+                next_tx_id: AtomicU64::new(REPLICA_TX_ID_BASE),
                 current_tx: 0,
                 in_explicit_tx: false,
                 pin_cores,
@@ -541,21 +579,6 @@ impl ShardCluster {
                 shards: repl_shards,
             },
         ))
-    }
-
-    /// Sync the cluster's tx counter with the max across all shards.
-    /// This is needed on replicas where WAL replay advances shard-level
-    /// counters past the cluster's initial value.
-    fn sync_tx_counter(&self) {
-        let mut max_tx: TxId = self.next_tx_id.load(Ordering::Relaxed);
-        for handle in &self.handles {
-            if let Response::TxId(next) = handle.call(Request::GetNextTxId) {
-                if next > max_tx {
-                    max_tx = next;
-                }
-            }
-        }
-        self.next_tx_id.fetch_max(max_tx, Ordering::Relaxed);
     }
 
     /// Flush all shards to disk. Each shard flushes its WAL and dirty pages.
@@ -824,8 +847,12 @@ impl StorageAccess for ShardCluster {
         if self.in_explicit_tx {
             return self.current_tx;
         }
-        // Sync the counter in case shard-level tx_ids advanced (e.g., via replication).
-        self.sync_tx_counter();
+        // No cross-shard sync needed: next_tx_id is seeded from a range
+        // that's disjoint from real (primary-issued/replicated) tx_ids on
+        // replica clusters (see REPLICA_TX_ID_BASE), and on
+        // standalone/primary clusters shard-level counters can never
+        // outrun this one (they only ever advance via tx_ids this counter
+        // itself issued).
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
         self.current_tx = tx_id;
         for handle in &self.handles {
@@ -1337,5 +1364,69 @@ mod tests {
                 .unwrap();
             assert_eq!(result.rows[0][0], Value::Int(199));
         }
+    }
+
+    // -- Regression tests for findings #7/#8/#13: replica-cluster tx_ids
+    // must be structurally disjoint from real primary-issued/replicated
+    // tx_ids, with zero cross-shard synchronization cost on any role. -----
+
+    #[test]
+    fn replica_cluster_starts_next_tx_id_in_reserved_high_range() {
+        let (cluster, _handles) = ShardCluster::new_replica(1, false);
+        assert_eq!(
+            cluster.next_tx_id.load(Ordering::Relaxed),
+            REPLICA_TX_ID_BASE,
+            "a freshly-spawned replica cluster's tx_id counter must start \
+             at the reserved base, never in the low range real tx_ids use"
+        );
+    }
+
+    #[test]
+    fn replica_cluster_auto_commit_tx_ids_stay_in_reserved_high_range() {
+        let (mut cluster, _handles) = ShardCluster::new_replica(1, false);
+
+        // Several auto-commit read queries in a row -- each one calls
+        // begin_tx() internally. None may ever produce a tx_id anywhere
+        // near the low range a primary uses.
+        for _ in 0..5 {
+            cluster.query("MATCH (n) RETURN n").unwrap();
+        }
+        assert!(
+            cluster.next_tx_id.load(Ordering::Relaxed) > REPLICA_TX_ID_BASE,
+            "auto-commit tx_ids on a replica must be drawn from the \
+             reserved high range"
+        );
+    }
+
+    #[test]
+    fn replica_cluster_explicit_tx_ids_also_stay_in_reserved_high_range() {
+        let (mut cluster, _handles) = ShardCluster::new_replica(1, false);
+
+        // Finding #8: begin_explicit_tx must not skip the same protection
+        // auto-commit begin_tx gets. With the disjoint-range design there's
+        // no special-casing needed -- verify it holds anyway.
+        let tx_id = cluster.begin_explicit_tx();
+        assert!(
+            tx_id >= REPLICA_TX_ID_BASE,
+            "explicit BEGIN on a replica must draw from the reserved high \
+             range, not collide with a primary's low tx_id range"
+        );
+        cluster.commit_explicit_tx();
+
+        let tx_id_2 = cluster.begin_explicit_tx();
+        assert!(tx_id_2 > tx_id, "successive explicit tx_ids must advance");
+        cluster.abort_explicit_tx();
+    }
+
+    #[test]
+    fn standalone_and_primary_clusters_unaffected_by_replica_tx_id_range() {
+        // Standalone/primary clusters must keep using the plain low range
+        // starting at 1 -- only new_replica/open_replica opt into the
+        // reserved high range.
+        let (cluster, _handles) = ShardCluster::new_primary(1, false);
+        assert_eq!(cluster.next_tx_id.load(Ordering::Relaxed), 1);
+
+        let cluster = ShardCluster::new(1);
+        assert_eq!(cluster.next_tx_id.load(Ordering::Relaxed), 1);
     }
 }

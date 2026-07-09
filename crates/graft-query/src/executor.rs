@@ -1129,7 +1129,7 @@ mod tests {
         fn scan_nodes(&self, label: Option<&str>) -> Vec<NodeInfo> {
             self.nodes
                 .iter()
-                .filter(|n| label.map_or(true, |l| n.label.as_deref() == Some(l)))
+                .filter(|n| label.is_none_or(|l| n.label.as_deref() == Some(l)))
                 .map(|n| NodeInfo {
                     id: n.id,
                     label: n.label.clone(),
@@ -1157,7 +1157,7 @@ mod tests {
             self.edges
                 .iter()
                 .filter(|e| {
-                    e.source == node_id && label.map_or(true, |l| e.label.as_deref() == Some(l))
+                    e.source == node_id && label.is_none_or(|l| e.label.as_deref() == Some(l))
                 })
                 .map(|e| EdgeInfo {
                     id: e.id,
@@ -1172,7 +1172,7 @@ mod tests {
             self.edges
                 .iter()
                 .filter(|e| {
-                    e.target == node_id && label.map_or(true, |l| e.label.as_deref() == Some(l))
+                    e.target == node_id && label.is_none_or(|l| e.label.as_deref() == Some(l))
                 })
                 .map(|e| EdgeInfo {
                     id: e.id,
@@ -1255,7 +1255,7 @@ mod tests {
     // -- Helper to run a query against a storage ----------------------------
 
     fn run(query: &str, storage: &mut MemoryStorage) -> Result<QueryResult, String> {
-        let stmt = crate::parse(query).map_err(|e| e)?;
+        let stmt = crate::parse(query)?;
         let plan = crate::planner::plan(&stmt).map_err(|e| e.to_string())?;
         execute(&plan, storage).map_err(|e| e.to_string())
     }

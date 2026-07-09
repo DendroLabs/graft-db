@@ -509,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn property_record_float_round_trip() {
         let rec = PropertyRecord::new_float(1, ENTITY_TYPE_NODE, "score", 3.14);
         let bytes = rec.to_bytes();

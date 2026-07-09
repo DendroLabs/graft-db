@@ -2,9 +2,19 @@ use graft_txn::wal::WalRecord;
 
 use crate::commit_buffer::CommitBuffer;
 use crate::protocol::WalBatchMsg;
+use crate::shared_queue::SharedQueue;
+
+/// Maximum bytes of undelivered batches to buffer per replica. Beyond this,
+/// a disconnected or badly-lagging replica is evicted rather than letting
+/// its queue grow without bound — it must reconnect and fully resync. This
+/// mirrors `WalRetention::default_1gb()`; there is no WAL-replay-based
+/// catch-up path yet (planned for the Phase 8g snapshot-shipping work), so
+/// "evict and require a fresh resync" is the correct, bounded, explicit
+/// failure mode rather than silent unbounded growth.
+const MAX_REPLICA_OUTBOX_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Identifies a connected replica for tracking ACK state.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ReplicaState {
     pub id: String,
     pub shard_id: u8,
@@ -12,6 +22,14 @@ pub struct ReplicaState {
     pub acked_lsn: u64,
     /// Whether this replica is currently connected.
     pub connected: bool,
+    /// Whether this replica was evicted for exceeding
+    /// `MAX_REPLICA_OUTBOX_BYTES`. Once evicted, no further batches are
+    /// fanned out to it — it must reconnect (which allocates a fresh outbox
+    /// via `ReplicaOutboxRegistry`) to resume.
+    pub evicted: bool,
+    /// This replica's outbound queue, shared with the network writer thread
+    /// (resolved through `ReplicaOutboxRegistry` so reconnects reuse it).
+    outbox: SharedQueue<WalBatchMsg>,
 }
 
 /// Ships committed WAL records to replicas.
@@ -46,7 +64,9 @@ impl ReplicationSender {
         self.commit_buffer.append(record);
     }
 
-    /// Process committed records into outbound batches.
+    /// Process committed records into outbound batches, fanning each new
+    /// batch out to every registered replica's own outbox.
+    ///
     /// Call this periodically (e.g., in the event loop's poll_replication phase).
     pub fn poll(&mut self) {
         if !self.commit_buffer.has_ready() {
@@ -62,10 +82,37 @@ impl ReplicationSender {
         if batch.last_lsn > self.last_shipped_lsn {
             self.last_shipped_lsn = batch.last_lsn;
         }
+
+        // Fan out to every replica that has ever registered on this shard.
+        // If none has, there's nothing to retain — this is what keeps an
+        // unreplicated primary's memory bounded (finding #10).
+        let batch_bytes = batch.records.len();
+        for r in &mut self.replicas {
+            if r.evicted {
+                continue;
+            }
+            let buffered = r.outbox.total_bytes_by(|b| b.records.len());
+            if buffered + batch_bytes > MAX_REPLICA_OUTBOX_BYTES {
+                tracing::error!(
+                    "replica {} on shard {} exceeded the {}-byte retention \
+                     window; evicting — it must reconnect and fully resync",
+                    r.id,
+                    self.shard_id,
+                    MAX_REPLICA_OUTBOX_BYTES
+                );
+                r.evicted = true;
+                r.connected = false;
+                continue;
+            }
+            r.outbox.push(batch.clone());
+        }
+
         self.outbound.push(batch);
     }
 
-    /// Drain outbound batches ready for network transmission.
+    /// Drain outbound batches produced by the last `poll()`. Kept for
+    /// introspection/testing — production delivery goes through each
+    /// replica's own outbox (see `poll()`), not this shared buffer.
     pub fn drain_outbound(&mut self) -> Vec<WalBatchMsg> {
         std::mem::take(&mut self.outbound)
     }
@@ -79,17 +126,32 @@ impl ReplicationSender {
         }
     }
 
-    /// Register a new replica connection.
-    pub fn add_replica(&mut self, id: String, shard_id: u8, last_lsn: u64) {
+    /// Register a replica connection. If `id` is already known (a
+    /// reconnect), the existing entry is resumed in place — `acked_lsn`
+    /// and any evicted state are preserved rather than reset, and the
+    /// `outbox` clone passed in is expected to be the same underlying
+    /// queue as before (guaranteed by resolving it through the same
+    /// `ReplicaOutboxRegistry`).
+    pub fn add_replica(&mut self, id: String, shard_id: u8, outbox: SharedQueue<WalBatchMsg>) {
+        if let Some(r) = self.replicas.iter_mut().find(|r| r.id == id) {
+            r.shard_id = shard_id;
+            r.connected = true;
+            r.outbox = outbox;
+            return;
+        }
         self.replicas.push(ReplicaState {
             id,
             shard_id,
-            acked_lsn: last_lsn,
+            acked_lsn: 0,
             connected: true,
+            evicted: false,
+            outbox,
         });
     }
 
-    /// Mark a replica as disconnected.
+    /// Mark a replica as disconnected. Its outbox and ACK state are kept
+    /// (bounded by `MAX_REPLICA_OUTBOX_BYTES`) so a reconnect can resume
+    /// without data loss.
     pub fn remove_replica(&mut self, id: &str) {
         if let Some(r) = self.replicas.iter_mut().find(|r| r.id == id) {
             r.connected = false;
@@ -225,8 +287,8 @@ mod tests {
     #[test]
     fn sender_tracks_replica_acks() {
         let mut sender = ReplicationSender::new(0);
-        sender.add_replica("replica-1".into(), 0, 0);
-        sender.add_replica("replica-2".into(), 0, 0);
+        sender.add_replica("replica-1".into(), 0, SharedQueue::new());
+        sender.add_replica("replica-2".into(), 0, SharedQueue::new());
 
         sender.on_ack("replica-1", 100);
         sender.on_ack("replica-2", 50);
@@ -240,8 +302,8 @@ mod tests {
     #[test]
     fn sender_disconnected_replica_excluded_from_min() {
         let mut sender = ReplicationSender::new(0);
-        sender.add_replica("replica-1".into(), 0, 0);
-        sender.add_replica("replica-2".into(), 0, 0);
+        sender.add_replica("replica-1".into(), 0, SharedQueue::new());
+        sender.add_replica("replica-2".into(), 0, SharedQueue::new());
 
         sender.on_ack("replica-1", 100);
         sender.on_ack("replica-2", 50);
@@ -249,6 +311,87 @@ mod tests {
         // Disconnect the lagging replica
         sender.remove_replica("replica-2");
         assert_eq!(sender.min_acked_lsn(), 100);
+    }
+
+    #[test]
+    fn poll_fans_batch_out_to_every_registered_replica() {
+        let mut sender = ReplicationSender::new(0);
+        let q1 = SharedQueue::new();
+        let q2 = SharedQueue::new();
+        sender.add_replica("replica-1".into(), 0, q1.clone());
+        sender.add_replica("replica-2".into(), 0, q2.clone());
+
+        sender.on_wal_record(make_record(1, WalRecordType::Begin, 0));
+        sender.on_wal_record(make_page_write(1, 24, 1));
+        sender.on_wal_record(make_record(1, WalRecordType::Commit, 128));
+        sender.poll();
+
+        // Each replica gets its own full copy of the batch — not an
+        // arbitrary split of a single shared queue.
+        assert_eq!(q1.len(), 1);
+        assert_eq!(q2.len(), 1);
+        assert_eq!(q1.peek_front().unwrap().last_lsn, 128);
+        assert_eq!(q2.peek_front().unwrap().last_lsn, 128);
+    }
+
+    #[test]
+    fn poll_retains_nothing_when_no_replica_ever_registered() {
+        let mut sender = ReplicationSender::new(0);
+
+        sender.on_wal_record(make_record(1, WalRecordType::Begin, 0));
+        sender.on_wal_record(make_record(1, WalRecordType::Commit, 24));
+        sender.poll();
+
+        // No replica has ever registered, so nothing should have been
+        // retained anywhere reachable via a replica queue.
+        assert!(sender.replicas().is_empty());
+    }
+
+    #[test]
+    fn reconnect_reuses_existing_replica_state_and_outbox() {
+        let mut sender = ReplicationSender::new(0);
+        let outbox = SharedQueue::new();
+        sender.add_replica("replica-1".into(), 0, outbox.clone());
+        sender.on_ack("replica-1", 42);
+        sender.remove_replica("replica-1");
+        assert_eq!(sender.replicas().len(), 1);
+        assert!(!sender.replicas()[0].connected);
+
+        // Reconnect: same id, freshly-looked-up (but identical, per the
+        // registry contract) outbox handle.
+        sender.add_replica("replica-1".into(), 0, outbox.clone());
+        assert_eq!(sender.replicas().len(), 1, "must not append a ghost entry");
+        assert!(sender.replicas()[0].connected);
+        assert_eq!(
+            sender.replicas()[0].acked_lsn,
+            42,
+            "acked_lsn must not reset on reconnect"
+        );
+    }
+
+    #[test]
+    fn replica_exceeding_outbox_cap_is_evicted_not_grown_unbounded() {
+        let mut sender = ReplicationSender::new(0);
+        let outbox = SharedQueue::new();
+        sender.add_replica("slow-replica".into(), 0, outbox.clone());
+
+        // Pre-fill the outbox past the cap to simulate a replica that's
+        // been disconnected long enough to accumulate a huge backlog.
+        outbox.push(WalBatchMsg {
+            shard_id: 0,
+            first_lsn: 0,
+            last_lsn: 0,
+            records: vec![0u8; MAX_REPLICA_OUTBOX_BYTES + 1],
+        });
+
+        sender.on_wal_record(make_record(1, WalRecordType::Begin, 0));
+        sender.on_wal_record(make_record(1, WalRecordType::Commit, 24));
+        sender.poll();
+
+        assert!(sender.replicas()[0].evicted);
+        assert!(!sender.replicas()[0].connected);
+        // The new batch was not appended on top of the already-oversized backlog.
+        assert_eq!(outbox.len(), 1);
     }
 
     #[test]

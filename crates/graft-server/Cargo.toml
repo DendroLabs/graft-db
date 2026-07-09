@@ -21,3 +21,5 @@ clap = { workspace = true }
 
 [dev-dependencies]
 graft-client = { workspace = true }
+graft-txn = { workspace = true }
+tempfile = { workspace = true }

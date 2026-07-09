@@ -469,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn numbers() {
         assert_eq!(lex("42 3.14"), vec![Token::Integer(42), Token::Float(3.14)]);
     }

@@ -585,7 +585,9 @@ dependencies = [
  "graft-query",
  "graft-repl",
  "graft-runtime",
+ "graft-txn",
  "rmp-serde",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

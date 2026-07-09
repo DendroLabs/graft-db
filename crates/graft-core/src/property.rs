@@ -66,6 +66,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn from_conversions() {
         assert_eq!(PropertyValue::from(true), PropertyValue::Bool(true));
         assert_eq!(PropertyValue::from(42i64), PropertyValue::Int(42));

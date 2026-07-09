@@ -1,4 +1,5 @@
 mod admin;
+mod identity;
 mod metrics;
 mod replication;
 
@@ -163,11 +164,14 @@ fn main() {
         match role {
             ReplicationRole::Primary => {
                 let repl_addr = format!("{}:{}", args.host, args.replication_port);
-                replication::run_primary_listener(repl_addr, handles);
+                let cluster_id = identity::load_or_create_cluster_id(args.data_dir.as_deref());
+                replication::run_primary_listener(repl_addr, handles, cluster_id);
             }
             ReplicationRole::Replica => {
                 let primary_addr = args.primary.clone().unwrap();
-                replication::run_replica_connector(primary_addr, handles);
+                let repl_identity =
+                    identity::ReplicaIdentity::load_or_create(args.data_dir.as_deref());
+                replication::run_replica_connector(primary_addr, handles, repl_identity);
             }
             ReplicationRole::Standalone => {}
         }

@@ -41,8 +41,6 @@ pub struct ShardEventLoop {
     repl_sender: Option<ReplicationSender>,
     /// Replication receiver (replica mode) — receives and applies WAL records from primary.
     repl_receiver: Option<ReplicationReceiver>,
-    /// Primary: outbound batches for network writer thread.
-    repl_outbox: Option<SharedQueue<WalBatchMsg>>,
     /// Primary: ACKs from replicas via network reader thread.
     repl_ack_inbox: Option<SharedQueue<(String, u64)>>,
     /// Primary: dynamic replica registration from network acceptor.
@@ -71,7 +69,6 @@ impl ShardEventLoop {
             ticks: 0,
             repl_sender: None,
             repl_receiver: None,
-            repl_outbox: None,
             repl_ack_inbox: None,
             repl_control: None,
             repl_inbox: None,
@@ -97,7 +94,6 @@ impl ShardEventLoop {
             ticks: 0,
             repl_sender: None,
             repl_receiver: None,
-            repl_outbox: None,
             repl_ack_inbox: None,
             repl_control: None,
             repl_inbox: None,
@@ -119,11 +115,9 @@ impl ShardEventLoop {
     /// Set primary-mode replication queues.
     pub fn set_repl_primary_queues(
         &mut self,
-        outbox: SharedQueue<WalBatchMsg>,
         ack_inbox: SharedQueue<(String, u64)>,
         control: SharedQueue<ReplControl>,
     ) {
-        self.repl_outbox = Some(outbox);
         self.repl_ack_inbox = Some(ack_inbox);
         self.repl_control = Some(control);
     }
@@ -223,7 +217,8 @@ impl ShardEventLoop {
     }
 
     /// Poll replication: on primary, drain WAL records from shard into sender,
-    /// push batches to outbox. On replica, drain inbox, apply records, push ACKs.
+    /// which fans new batches out to each registered replica's own outbox.
+    /// On replica, drain inbox, apply records, push ACKs.
     fn poll_replication(&mut self) -> usize {
         let mut work = 0;
 
@@ -239,14 +234,16 @@ impl ShardEventLoop {
                         ReplControl::Register {
                             id,
                             shard_id,
-                            last_lsn,
-                        } => sender.add_replica(id, shard_id, last_lsn),
+                            outbox,
+                        } => sender.add_replica(id, shard_id, outbox),
                         ReplControl::Unregister { id } => sender.remove_replica(&id),
                     }
                 }
             }
 
-            // 2. Drain repl_log from shard into sender
+            // 2. Drain repl_log from shard into sender, then poll it — poll()
+            // fans any newly-ready batch out to every registered replica's
+            // own outbox directly (see ReplicationSender::poll).
             let records = self.shard.drain_repl_log();
             work += records.len();
             {
@@ -254,17 +251,10 @@ impl ShardEventLoop {
                 for record in records {
                     sender.on_wal_record(record);
                 }
-
-                // 3. Poll sender → drain batches → push to outbox
                 sender.poll();
-                let batches = sender.drain_outbound();
-                work += batches.len();
-                if let Some(ref outbox) = self.repl_outbox {
-                    outbox.push_batch(batches);
-                }
             }
 
-            // 4. Drain ACK inbox → feed to sender
+            // 3. Drain ACK inbox → feed to sender
             if let Some(ref ack_inbox) = self.repl_ack_inbox {
                 let acks = ack_inbox.drain();
                 work += acks.len();
@@ -281,9 +271,36 @@ impl ShardEventLoop {
             if let Some(ref inbox) = self.repl_inbox {
                 let batches = inbox.drain();
                 work += batches.len();
+                let shard_id = self.shard.shard_id();
                 let receiver = self.repl_receiver.as_mut().unwrap();
-                for batch in &batches {
-                    let _ = receiver.on_batch(batch);
+                // Once poisoned by a corrupted/truncated batch, stop calling
+                // on_batch entirely: it would just keep returning the same
+                // poison error for every remaining batch in this drain, and
+                // logging that on every tick forever would be pure spam
+                // (the condition was already logged once, below, the tick
+                // it happened).
+                if !receiver.is_poisoned() {
+                    for batch in &batches {
+                        if let Err(e) = receiver.on_batch(batch) {
+                            // A corrupted/truncated batch can't be locally
+                            // repaired and must never be silently skipped
+                            // over (finding #6): skipping it would let a
+                            // later batch's higher LSN — and its ACK — make
+                            // the primary believe this replica has
+                            // everything, when it is permanently missing a
+                            // transaction. Surface it loudly; the receiver
+                            // is now poisoned and stops applying/ACKing
+                            // anything further until an operator resyncs it.
+                            tracing::error!(
+                                shard_id,
+                                batch_last_lsn = batch.last_lsn,
+                                error = %e,
+                                "replication batch rejected; this replica will not apply or ACK \
+                                 any further WAL records until a manual resync"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -425,7 +442,6 @@ impl ShardEventLoop {
                 self.shard.abort_current_tx();
                 Response::Done
             }
-            Request::GetNextTxId => Response::TxId(self.shard.next_local_tx()),
             Request::Shutdown => unreachable!("handled in poll_coordinator"),
         }
     }
@@ -791,13 +807,22 @@ mod tests {
         let (req_tx, req_rx) = spsc::channel::<Request>(64);
         let (resp_tx, resp_rx) = spsc::channel::<Response>(64);
 
-        let outbox = SharedQueue::new();
         let ack_inbox = SharedQueue::new();
         let control = SharedQueue::new();
+        // A registered replica's own outbox — this is what production code
+        // creates via ReplicaOutboxRegistry and hands over in a Register
+        // control message.
+        let replica_outbox = SharedQueue::new();
 
         let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
         el.set_repl_sender(graft_repl::ReplicationSender::new(0));
-        el.set_repl_primary_queues(outbox.clone(), ack_inbox.clone(), control.clone());
+        el.set_repl_primary_queues(ack_inbox.clone(), control.clone());
+
+        control.push(ReplControl::Register {
+            id: "replica-1".into(),
+            shard_id: 0,
+            outbox: replica_outbox.clone(),
+        });
 
         // Create data via coordinator
         req_tx.push(Request::BeginTx { tx_id: 1 }).unwrap();
@@ -817,13 +842,17 @@ mod tests {
         el.tick();
         resp_rx.pop(); // Done
 
-        // poll_replication should have drained repl_log into sender → outbox
-        // Might need a few extra ticks for the sender to poll
+        // poll_replication should have drained repl_log into sender, which
+        // fans the resulting batch out to the registered replica's outbox.
+        // Might need a few extra ticks for the sender to poll.
         el.tick();
         el.tick();
 
-        let batches = outbox.drain();
-        assert!(!batches.is_empty(), "expected outbox to have batches");
+        let batches = replica_outbox.drain();
+        assert!(
+            !batches.is_empty(),
+            "expected replica outbox to have batches"
+        );
         assert_eq!(batches[0].shard_id, 0);
     }
 
@@ -843,7 +872,6 @@ mod tests {
             body: WalBody::Empty,
         });
         // Create a node page write
-        use graft_core::constants::RECORD_SIZE;
         use graft_core::NodeId;
         use graft_storage::NodeRecord;
         let node_id = NodeId::new(0, 1);
@@ -872,7 +900,7 @@ mod tests {
 
         // Set up replica event loop
         let shard = Shard::new(0);
-        let (req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (_req_tx, req_rx) = spsc::channel::<Request>(64);
         let (resp_tx, _resp_rx) = spsc::channel::<Response>(64);
 
         let inbox = SharedQueue::new();
@@ -892,6 +920,96 @@ mod tests {
         let acks = ack_outbox.drain();
         assert!(!acks.is_empty(), "expected ACK in ack_outbox");
         assert_eq!(acks[0].shard_id, 0);
+    }
+
+    /// Regression test for finding #6, exercised through the full replica
+    /// event-loop path (not just the receiver in isolation): a batch that
+    /// fails CRC verification must not be silently dropped while later,
+    /// valid batches keep getting applied — that would leave the shard's
+    /// graph permanently missing data with no observable sign of it. The
+    /// event loop must stop applying/ACKing once the receiver is poisoned.
+    #[test]
+    fn poll_replication_replica_stops_applying_after_corrupted_batch() {
+        use crate::cluster::{Request, Response};
+        use crate::spsc;
+        use graft_core::{LabelId, NodeId};
+        use graft_repl::ReplicationSender;
+        use graft_storage::NodeRecord;
+        use graft_txn::wal::{WalBody, WalRecord, WalRecordType};
+
+        fn node_batch(sender: &mut ReplicationSender, tx_id: u64, node_local: u64, base_lsn: u64) {
+            sender.on_wal_record(WalRecord {
+                lsn: base_lsn,
+                tx_id,
+                record_type: WalRecordType::Begin,
+                body: WalBody::Empty,
+            });
+            let node_id = NodeId::new(0, node_local);
+            let node_rec = NodeRecord::new(node_id, LabelId::NONE, tx_id);
+            sender.on_wal_record(WalRecord {
+                lsn: base_lsn + 1,
+                tx_id,
+                record_type: WalRecordType::PageWrite,
+                body: WalBody::PageWrite {
+                    page_id: node_local, // distinct page per tx to avoid overlap
+                    slot: 0,
+                    page_type: 1,
+                    data: node_rec.to_bytes(),
+                },
+            });
+            sender.on_wal_record(WalRecord {
+                lsn: base_lsn + 2,
+                tx_id,
+                record_type: WalRecordType::Commit,
+                body: WalBody::Empty,
+            });
+            sender.poll();
+        }
+
+        let mut sender = ReplicationSender::new(0);
+        node_batch(&mut sender, 1, 1, 1); // tx 1: will arrive corrupted
+        node_batch(&mut sender, 2, 2, 4); // tx 2: valid, higher LSN
+
+        let mut batches = sender.drain_outbound();
+        assert_eq!(batches.len(), 2);
+        batches[0].records[5] ^= 0xFF; // corrupt tx 1's batch only
+
+        let shard = Shard::new(0);
+        let (_req_tx, req_rx) = spsc::channel::<Request>(64);
+        let (resp_tx, _resp_rx) = spsc::channel::<Response>(64);
+
+        let inbox = SharedQueue::new();
+        let ack_outbox = SharedQueue::new();
+
+        let mut el = ShardEventLoop::with_coordinator(shard, req_rx, resp_tx);
+        el.set_repl_receiver(graft_repl::ReplicationReceiver::new(0));
+        el.set_repl_replica_queues(inbox.clone(), ack_outbox.clone());
+
+        inbox.push(batches[0].clone()); // corrupted
+        inbox.push(batches[1].clone()); // valid, would bridge the gap if applied
+
+        el.tick();
+
+        assert!(
+            el.repl_receiver().unwrap().is_poisoned(),
+            "receiver must be poisoned after the corrupted batch"
+        );
+        // Neither transaction's node made it into the shard: tx 1 was
+        // corrupted, and tx 2 must have been rejected too (not applied
+        // "around" the gap).
+        assert!(
+            el.shard.get_node(NodeId::new(0, 1)).is_none(),
+            "corrupted tx must not be applied"
+        );
+        assert!(
+            el.shard.get_node(NodeId::new(0, 2)).is_none(),
+            "a later valid batch must not be applied once poisoned — that \
+             would silently bridge the gap left by the corrupted batch"
+        );
+        assert!(
+            ack_outbox.drain().is_empty(),
+            "no ACK must be sent for a poisoned replica's batches"
+        );
     }
 
     #[test]

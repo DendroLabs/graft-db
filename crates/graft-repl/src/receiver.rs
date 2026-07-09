@@ -14,6 +14,18 @@ pub struct ReplicationReceiver {
     pending_records: Vec<WalRecord>,
     /// ACKs to send back to the primary.
     pending_acks: Vec<WalAckMsg>,
+    /// Set once a batch fails CRC verification or is truncated. A corrupted
+    /// batch can leave a gap in the replicated WAL stream (e.g. a lost
+    /// PageWrite whose Commit still arrives), and applying anything *after*
+    /// the gap — or worse, ACKing it — would let the primary believe this
+    /// replica is fully caught up when it is permanently missing data
+    /// (silent divergence). Once poisoned, every subsequent batch is
+    /// rejected without being applied or ACKed: the replica's replicated
+    /// state is stuck exactly where it was at the moment of corruption,
+    /// which is observable (ACK'd LSN stops advancing) rather than silent.
+    /// There is no in-place repair; recovery requires an operator-driven
+    /// full resync (Phase 8g, not yet built).
+    poisoned: Option<String>,
 }
 
 impl ReplicationReceiver {
@@ -23,6 +35,7 @@ impl ReplicationReceiver {
             last_applied_lsn: 0,
             pending_records: Vec::new(),
             pending_acks: Vec::new(),
+            poisoned: None,
         }
     }
 
@@ -32,19 +45,36 @@ impl ReplicationReceiver {
             last_applied_lsn,
             pending_records: Vec::new(),
             pending_acks: Vec::new(),
+            poisoned: None,
         }
     }
 
     /// Process an incoming WAL batch from the primary.
     /// Deserializes the raw bytes into WalRecords with CRC verification.
-    /// Returns Ok(count) with the number of records deserialized, or Err on CRC failure.
+    /// Returns Ok(count) with the number of records deserialized, or Err on
+    /// CRC failure/truncation. Once poisoned by a prior corrupted batch,
+    /// every call returns Err without applying or ACKing anything (see
+    /// `poisoned` field doc and `is_poisoned`).
     pub fn on_batch(&mut self, batch: &WalBatchMsg) -> Result<usize, String> {
+        if let Some(ref reason) = self.poisoned {
+            return Err(format!(
+                "replication receiver poisoned by an earlier corrupted batch ({reason}); \
+                 refusing further batches until a manual resync"
+            ));
+        }
+
         // Skip batches we've already applied
         if batch.last_lsn <= self.last_applied_lsn && self.last_applied_lsn > 0 {
             return Ok(0);
         }
 
-        let records = deserialize_wal_records(&batch.records)?;
+        let records = match deserialize_wal_records(&batch.records) {
+            Ok(r) => r,
+            Err(e) => {
+                self.poisoned = Some(e.clone());
+                return Err(e);
+            }
+        };
         let count = records.len();
 
         self.pending_records.extend(records);
@@ -61,6 +91,18 @@ impl ReplicationReceiver {
         });
 
         Ok(count)
+    }
+
+    /// True once a corrupted/truncated batch has permanently halted this
+    /// receiver. The replica will not apply or ACK anything further; an
+    /// operator must resync it from scratch.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    /// Why this receiver stopped, if it did.
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.poisoned.as_deref()
     }
 
     /// Drain records that are ready to be applied to the shard.
@@ -252,6 +294,61 @@ mod tests {
         let result = receiver.on_batch(&batches[0]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("CRC mismatch"));
+        assert!(
+            receiver.is_poisoned(),
+            "a corrupted batch must poison the receiver"
+        );
+    }
+
+    /// Regression test for finding #6: a corrupted batch must not be a
+    /// silent, self-healing gap. Before the fix, `on_batch`'s error was
+    /// discarded and the *next* good batch's higher LSN (and its ACK) would
+    /// make the primary believe the replica had everything, even though a
+    /// transaction was permanently missing. After the fix, the receiver
+    /// must refuse every subsequent batch — even perfectly valid ones —
+    /// so neither `drain_records()` nor the ACK stream ever move past the
+    /// point of corruption.
+    #[test]
+    fn corrupted_batch_poisons_receiver_and_blocks_all_later_batches() {
+        let mut sender = ReplicationSender::new(0);
+
+        // tx 1 — will arrive corrupted.
+        sender.on_wal_record(make_record(1, WalRecordType::Begin, 0));
+        sender.on_wal_record(make_record(1, WalRecordType::Commit, 24));
+        sender.poll();
+
+        // tx 2 — perfectly valid, higher LSN, arrives after the corrupted batch.
+        sender.on_wal_record(make_record(2, WalRecordType::Begin, 48));
+        sender.on_wal_record(make_page_write(2, 72, 10));
+        sender.on_wal_record(make_record(2, WalRecordType::Commit, 176));
+        sender.poll();
+
+        let mut batches = sender.drain_outbound();
+        assert_eq!(batches.len(), 2);
+        // Corrupt the first (lower-LSN) batch only.
+        batches[0].records[5] ^= 0xFF;
+
+        let mut receiver = ReplicationReceiver::new(0);
+
+        let first = receiver.on_batch(&batches[0]);
+        assert!(first.is_err(), "corrupted batch must be rejected");
+        assert!(receiver.is_poisoned());
+        assert!(receiver.poison_reason().unwrap().contains("CRC mismatch"));
+
+        // The later, uncorrupted batch must ALSO be rejected — this is the
+        // crux of the fix. Silently accepting it would bridge the gap.
+        let second = receiver.on_batch(&batches[1]);
+        assert!(
+            second.is_err(),
+            "once poisoned, even a valid later batch must be rejected, \
+             not silently applied over the gap"
+        );
+
+        // Nothing from either batch was applied or ACKed — the primary
+        // must see this replica stalled, not falsely caught up.
+        assert!(receiver.drain_records().is_empty());
+        assert!(receiver.drain_acks().is_empty());
+        assert_eq!(receiver.last_applied_lsn(), 0);
     }
 
     #[test]
@@ -288,7 +385,7 @@ mod tests {
     fn end_to_end_sender_receiver() {
         // Full pipeline: sender buffers, commits, ships, receiver applies
         let mut sender = ReplicationSender::new(0);
-        sender.add_replica("r1".into(), 0, 0);
+        sender.add_replica("r1".into(), 0, crate::SharedQueue::new());
 
         // Write a committed transaction
         sender.on_wal_record(make_record(1, WalRecordType::Begin, 0));

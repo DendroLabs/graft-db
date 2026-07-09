@@ -44,11 +44,7 @@ fn start_test_server_with_shards(shard_count: usize) -> String {
                 let mut active_tx: Option<u64> = None;
 
                 // Message loop
-                loop {
-                    let (msg_type, payload) = match recv_message(&mut reader) {
-                        Ok(m) => m,
-                        Err(_) => break,
-                    };
+                while let Ok((msg_type, payload)) = recv_message(&mut reader) {
                     match msg_type {
                         MessageType::BeginTx => {
                             let tx_id = {

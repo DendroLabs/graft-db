@@ -31,6 +31,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn page_geometry() {
         assert_eq!(PAGE_SIZE, 8192);
         assert_eq!(PAGE_USABLE_SIZE, 8160);

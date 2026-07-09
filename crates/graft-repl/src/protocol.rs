@@ -62,13 +62,28 @@ impl std::str::FromStr for ReplicationRole {
 // Replication wire messages (MessagePack payloads)
 // ---------------------------------------------------------------------------
 
-/// Sent by replica to primary on connection to identify itself.
+/// Exchanged between primary and replica on connection to identify and
+/// validate the pairing before any WAL traffic flows.
+///
+/// One connection multiplexes traffic for all shards (tagged by `shard_id`
+/// on each `WalBatchMsg`), so this is a single handshake per TCP connection,
+/// not one per shard.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplHelloMsg {
-    pub shard_id: u8,
-    pub role: u8, // 1=primary, 2=replica
-    pub last_lsn: u64,
+    /// Stable identity of the replica, persisted across reconnects (and,
+    /// for durable replicas, across restarts) so the primary can resume
+    /// delivery to the same per-replica outbox instead of starting fresh.
+    /// Unused (empty) in the primary's reply.
+    pub replica_id: String,
+    /// 0 = unknown (only valid on a replica's very first ever connection,
+    /// before it has adopted a primary's cluster identity). A primary
+    /// rejects any non-zero cluster_id that doesn't match its own.
     pub cluster_id: u64,
+    pub role: u8, // 1=primary, 2=replica
+    /// Total shard count of the sender. The primary rejects a replica whose
+    /// shard_count doesn't match its own rather than silently shipping only
+    /// the overlapping shard range.
+    pub shard_count: u8,
 }
 
 /// Batch of committed WAL records shipped from primary to replica.
@@ -210,10 +225,10 @@ mod tests {
     fn repl_hello_round_trip() {
         let mut buf = Vec::new();
         let msg = ReplHelloMsg {
-            shard_id: 3,
+            replica_id: "replica-abc".into(),
             role: 2,
-            last_lsn: 12345,
             cluster_id: 42,
+            shard_count: 8,
         };
         send_repl_hello(&mut buf, &msg).unwrap();
 
@@ -221,9 +236,9 @@ mod tests {
         let (msg_type, payload) = recv_repl_message(&mut reader).unwrap();
         assert_eq!(msg_type, ReplMessageType::ReplHello);
         let decoded: ReplHelloMsg = rmp_serde::from_slice(&payload).unwrap();
-        assert_eq!(decoded.shard_id, 3);
-        assert_eq!(decoded.last_lsn, 12345);
+        assert_eq!(decoded.replica_id, "replica-abc");
         assert_eq!(decoded.cluster_id, 42);
+        assert_eq!(decoded.shard_count, 8);
     }
 
     #[test]

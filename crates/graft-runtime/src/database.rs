@@ -471,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn function_to_float() {
         let mut db = Database::new();
         db.query("CREATE (:N {v: '3.14'})").unwrap();
